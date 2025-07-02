@@ -2,6 +2,7 @@
 #define GUI_HH
 
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <GLFW/glfw3.h>
@@ -43,15 +44,42 @@ struct ApplicationState {
     // Viewer Options
     float rotation_degrees = 0.0f;
 
+    // Manual Adjustments
+    bool manual_adjustments_enabled = false;
+    bool auto_update_enabled = true;
+    
+    // AB Transform adjustments (izquierda -> central)
+    float ab_translation_x = 0.0f;
+    float ab_translation_y = 0.0f;
+    float ab_rotation_deg = 0.0f;
+    float ab_scale_x = 1.0f;
+    float ab_scale_y = 1.0f;
+    
+    // BC Transform adjustments (derecha -> central)
+    float bc_translation_x = 0.0f;
+    float bc_translation_y = 0.0f;
+    float bc_rotation_deg = 0.0f;
+    float bc_scale_x = 1.0f;
+    float bc_scale_y = 1.0f;
+
     // --- METHODS ---
     void InitializeStitching();
     void CreatePanorama();
     void ResetStitching();
+    void UpdatePanoramaWithAdjustments();
+    void ApplyInitialAdjustments();
 };
+
+// --- IMGUI SETTINGS HANDLER FUNCTIONS ---
+void* ManualAdjustments_ReadOpen(ImGuiContext*, ImGuiSettingsHandler*, const char* name);
+void ManualAdjustments_ReadLine(ImGuiContext*, ImGuiSettingsHandler*, void* entry, const char* line);
+void ManualAdjustments_WriteAll(ImGuiContext* ctx, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buf);
+void RegisterManualAdjustmentsHandler(ApplicationState* app_state);
 
 // --- GUI DRAWING FUNCTIONS ---
 void DrawStitchingSetupPanel(ApplicationState& state);
 void DrawImageViewerPanel(ApplicationState& state);
 void DrawStatusPanel(ApplicationState& state);
+void DrawManualAdjustmentsPanel(ApplicationState& state);
 
 #endif // GUI_HH

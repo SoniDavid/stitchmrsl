@@ -74,6 +74,9 @@ int main(int, char**) {
 
     // Application state
     ApplicationState app_state;
+    
+    // Register custom settings handler for manual adjustments
+    RegisterManualAdjustmentsHandler(&app_state);
 
     // Main loop
     while (!glfwWindowShouldClose(window))
@@ -92,6 +95,7 @@ int main(int, char**) {
         DrawStitchingSetupPanel(app_state);
         DrawImageViewerPanel(app_state);
         DrawStatusPanel(app_state);
+        DrawManualAdjustmentsPanel(app_state);
 
         // Rendering
         ImGui::Render();

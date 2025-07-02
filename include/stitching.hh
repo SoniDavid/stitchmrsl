@@ -52,6 +52,7 @@ public:
 
     // --- CORE STITCHING LOGIC ---
     cv::Mat CreatePanoramaFromPrecomputed();
+    cv::Mat CreatePanoramaWithCustomTransforms(const cv::Mat& custom_ab_transform, const cv::Mat& custom_bc_transform);
     void SetBlendingMode(BlendingMode mode);
 
 private:

@@ -235,6 +235,125 @@ cv::Mat StitchingPipeline::CreatePanoramaFromPrecomputed() {
     return panorama;
 }
 
+cv::Mat StitchingPipeline::CreatePanoramaWithCustomTransforms(const cv::Mat& custom_ab_transform, const cv::Mat& custom_bc_transform) {
+    if (cameras_.size() != 3 || test_images_.size() != 3) {
+        std::cerr << "ERROR: Prerequisites for stitching not met. Load all data first." << std::endl;
+        return cv::Mat();
+    }
+    
+    std::cout << "=== STARTING PANORAMA CREATION WITH CUSTOM TRANSFORMS ===" << std::endl;
+
+    // 1. Rectify all three images (reuse existing rectified images if available)
+    if (rectified_images_.size() != 3) {
+        rectified_images_.clear();
+        for (size_t i = 0; i < test_images_.size(); ++i) {
+            rectified_images_.push_back(RectifyImageFisheye(test_images_[i], cameras_[i].intrinsics));
+        }
+    }
+    cv::Mat& img_izq = rectified_images_[0];
+    cv::Mat& img_central = rectified_images_[1];
+    cv::Mat& img_der = rectified_images_[2];
+    std::cout << "1. Using rectified images." << std::endl;
+
+    // 2. Use custom transformations
+    // Apply custom AB transform to the loaded transform
+    cv::Mat base_ab_transform_3x3 = cv::Mat::eye(3, 3, CV_64F);
+    if (loaded_ab_transform_.valid) {
+        loaded_ab_transform_.similarity.copyTo(base_ab_transform_3x3(cv::Rect(0, 0, 3, 2)));
+    }
+    cv::Mat combined_ab_transform = custom_ab_transform * base_ab_transform_3x3;
+    
+    cv::Mat transform_central_to_izq_3x3 = combined_ab_transform;
+    cv::Mat transform_izq_to_central_3x3;
+    cv::invert(transform_central_to_izq_3x3, transform_izq_to_central_3x3);
+
+    // Apply custom BC transform to the loaded transform  
+    cv::Mat base_bc_transform_3x3 = cv::Mat::eye(3, 3, CV_64F);
+    if (loaded_bc_transform_.valid) {
+        loaded_bc_transform_.similarity.copyTo(base_bc_transform_3x3(cv::Rect(0, 0, 3, 2)));
+    }
+    cv::Mat transform_der_to_central_3x3 = custom_bc_transform * base_bc_transform_3x3;
+    std::cout << "2. Custom transformations applied." << std::endl;
+    
+    // 3. Calculate the global canvas size
+    std::vector<cv::Point2f> corners_izq = { {0,0}, {(float)img_izq.cols, 0}, {(float)img_izq.cols, (float)img_izq.rows}, {0, (float)img_izq.rows} };
+    std::vector<cv::Point2f> corners_central = { {0,0}, {(float)img_central.cols, 0}, {(float)img_central.cols, (float)img_central.rows}, {0, (float)img_central.rows} };
+    std::vector<cv::Point2f> corners_der = { {0,0}, {(float)img_der.cols, 0}, {(float)img_der.cols, (float)img_der.rows}, {0, (float)img_der.rows} };
+
+    std::vector<cv::Point2f> transformed_corners_izq;
+    std::vector<cv::Point2f> transformed_corners_der;
+    cv::perspectiveTransform(corners_izq, transformed_corners_izq, transform_izq_to_central_3x3);
+    cv::perspectiveTransform(corners_der, transformed_corners_der, transform_der_to_central_3x3);
+
+    std::vector<cv::Point2f> all_corners;
+    all_corners.insert(all_corners.end(), corners_central.begin(), corners_central.end());
+    all_corners.insert(all_corners.end(), transformed_corners_izq.begin(), transformed_corners_izq.end());
+    all_corners.insert(all_corners.end(), transformed_corners_der.begin(), transformed_corners_der.end());
+
+    cv::Rect bounding_box = cv::boundingRect(all_corners);
+    std::cout << "3. Global canvas calculated: " << bounding_box.width << "x" << bounding_box.height << std::endl;
+
+    // 4. Warp all images onto the final canvas
+    cv::Mat offset_transform = cv::Mat::eye(3, 3, CV_64F);
+    offset_transform.at<double>(0, 2) = -bounding_box.x;
+    offset_transform.at<double>(1, 2) = -bounding_box.y;
+
+    cv::Mat canvas(bounding_box.height, bounding_box.width, img_central.type(), cv::Scalar(0,0,0));
+
+    // Warp central (our reference)
+    cv::Mat warped_central;
+    cv::warpPerspective(img_central, warped_central, offset_transform, bounding_box.size());
+    
+    // Warp izquierda
+    cv::Mat warped_izq;
+    cv::warpPerspective(img_izq, warped_izq, offset_transform * transform_izq_to_central_3x3, bounding_box.size());
+
+    // Warp derecha
+    cv::Mat warped_der;
+    cv::warpPerspective(img_der, warped_der, offset_transform * transform_der_to_central_3x3, bounding_box.size());
+    std::cout << "4. All images warped to final canvas." << std::endl;
+
+    // 5. Blend the images together using the selected blending mode
+    cv::Mat panorama;
+    if (blending_mode_ == BlendingMode::AVERAGE) {
+        cv::max(warped_izq, warped_central, panorama);
+        cv::max(panorama, warped_der, panorama);
+        std::cout << "5. Images blended using cv::max." << std::endl;
+    } else {
+        // Use feathering blending
+        panorama = warped_central.clone();
+        BlendInPlace(panorama, warped_izq, BlendingMode::FEATHERING);
+        BlendInPlace(panorama, warped_der, BlendingMode::FEATHERING);
+        std::cout << "5. Images blended using feathering." << std::endl;
+    }
+
+    // 6. Crop final image to remove black borders
+    cv::Mat gray;
+    cv::cvtColor(panorama, gray, cv::COLOR_BGR2GRAY);
+    cv::threshold(gray, gray, 1, 255, cv::THRESH_BINARY);
+    
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(gray, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    if (!contours.empty()) {
+        double max_area = 0;
+        size_t max_area_idx = 0;
+        for (size_t i = 0; i < contours.size(); i++) {
+            double area = cv::contourArea(contours[i]);
+            if (area > max_area) {
+                max_area = area;
+                max_area_idx = i;
+            }
+        }
+        cv::Rect crop_rect = cv::boundingRect(contours[max_area_idx]);
+        std::cout << "6. Cropping panorama to content." << std::endl;
+        return panorama(crop_rect);
+    }
+    
+    std::cout << "6. No content found to crop, returning full canvas." << std::endl;
+    return panorama;
+}
+
 void StitchingPipeline::SetBlendingMode(BlendingMode mode) {
     blending_mode_ = mode;
 }

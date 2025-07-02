@@ -1,5 +1,6 @@
 #include "gui.hh"
 #include <iostream>
+#include <fstream>
 
 // --- HELPER FUNCTION ---
 void MatToTexture(const cv::Mat& mat, GLuint& texture_id) {
@@ -45,6 +46,9 @@ void ApplicationState::InitializeStitching() {
     if (calibration_loaded && test_images_loaded) {
         stitching_initialized = true;
         status_message = "Ready. Click 'Create Panorama'.";
+        
+        // Apply manual adjustments if they were loaded from settings
+        ApplyInitialAdjustments();
     } else {
         stitching_initialized = false;
         status_message = "Failed to load files. Check paths.";
@@ -57,16 +61,22 @@ void ApplicationState::CreatePanorama() {
         return;
     }
     status_message = "Processing...";
-    pipeline->SetBlendingMode(static_cast<BlendingMode>(selected_blending_mode));
-    stitched_mat = pipeline->CreatePanoramaFromPrecomputed();
-
-    if (!stitched_mat.empty()) {
-        MatToTexture(stitched_mat, stitched_texture_id);
-        status_message = "Panorama created successfully!";
-        // Save the result automatically
-        cv::imwrite("panorama_result.jpg", stitched_mat);
+    
+    // Use manual adjustments if enabled, otherwise use precomputed
+    if (manual_adjustments_enabled) {
+        UpdatePanoramaWithAdjustments();
     } else {
-        status_message = "Panorama creation failed.";
+        pipeline->SetBlendingMode(static_cast<BlendingMode>(selected_blending_mode));
+        stitched_mat = pipeline->CreatePanoramaFromPrecomputed();
+
+        if (!stitched_mat.empty()) {
+            MatToTexture(stitched_mat, stitched_texture_id);
+            status_message = "Panorama created successfully!";
+            // Save the result automatically
+            cv::imwrite("panorama_result.jpg", stitched_mat);
+        } else {
+            status_message = "Panorama creation failed.";
+        }
     }
 }
 
@@ -81,6 +91,138 @@ void ApplicationState::ResetStitching() {
         stitched_texture_id = 0;
     }
     status_message = "Pipeline reset. Initialize to begin.";
+}
+
+void ApplicationState::UpdatePanoramaWithAdjustments() {
+    if (!stitching_initialized) return;
+    
+    pipeline->SetBlendingMode(static_cast<BlendingMode>(selected_blending_mode));
+    
+    if (manual_adjustments_enabled) {
+        // Create custom transform matrices from adjustment parameters
+        
+        // AB Transform (izquierda -> central)
+        cv::Mat ab_custom = cv::Mat::eye(3, 3, CV_64F);
+        float ab_rad = ab_rotation_deg * CV_PI / 180.0f;
+        float ab_cos = cos(ab_rad);
+        float ab_sin = sin(ab_rad);
+        
+        ab_custom.at<double>(0, 0) = ab_cos * ab_scale_x;
+        ab_custom.at<double>(0, 1) = -ab_sin * ab_scale_x;
+        ab_custom.at<double>(0, 2) = ab_translation_x;
+        ab_custom.at<double>(1, 0) = ab_sin * ab_scale_y;
+        ab_custom.at<double>(1, 1) = ab_cos * ab_scale_y;
+        ab_custom.at<double>(1, 2) = ab_translation_y;
+        
+        // BC Transform (derecha -> central)
+        cv::Mat bc_custom = cv::Mat::eye(3, 3, CV_64F);
+        float bc_rad = bc_rotation_deg * CV_PI / 180.0f;
+        float bc_cos = cos(bc_rad);
+        float bc_sin = sin(bc_rad);
+        
+        bc_custom.at<double>(0, 0) = bc_cos * bc_scale_x;
+        bc_custom.at<double>(0, 1) = -bc_sin * bc_scale_x;
+        bc_custom.at<double>(0, 2) = bc_translation_x;
+        bc_custom.at<double>(1, 0) = bc_sin * bc_scale_y;
+        bc_custom.at<double>(1, 1) = bc_cos * bc_scale_y;
+        bc_custom.at<double>(1, 2) = bc_translation_y;
+        
+        stitched_mat = pipeline->CreatePanoramaWithCustomTransforms(ab_custom, bc_custom);
+    } else {
+        stitched_mat = pipeline->CreatePanoramaFromPrecomputed();
+    }
+    
+    if (!stitched_mat.empty()) {
+        MatToTexture(stitched_mat, stitched_texture_id);
+        status_message = "Panorama updated with adjustments!";
+    } else {
+        status_message = "Failed to update panorama.";
+    }
+}
+
+void ApplicationState::ApplyInitialAdjustments() {
+    // Apply manual adjustments that were loaded from ini file if enabled
+    if (manual_adjustments_enabled && stitching_initialized) {
+        UpdatePanoramaWithAdjustments();
+    }
+}
+
+// Global pointer to access ApplicationState from settings handlers
+static ApplicationState* g_app_state = nullptr;
+
+void* ManualAdjustments_ReadOpen(ImGuiContext*, ImGuiSettingsHandler*, const char* name) {
+    if (strcmp(name, "Data") == 0) {
+        return g_app_state; // Return our app state as the entry
+    }
+    return nullptr;
+}
+
+void ManualAdjustments_ReadLine(ImGuiContext*, ImGuiSettingsHandler*, void* entry, const char* line) {
+    if (!entry || !g_app_state) return;
+    
+    // Parse key=value pairs
+    const char* eq_pos = strchr(line, '=');
+    if (!eq_pos) return;
+    
+    size_t key_len = eq_pos - line;
+    const char* value_str = eq_pos + 1;
+    
+    if (strncmp(line, "manual_enabled", key_len) == 0) {
+        g_app_state->manual_adjustments_enabled = (strcmp(value_str, "1") == 0);
+    } else if (strncmp(line, "auto_update", key_len) == 0) {
+        g_app_state->auto_update_enabled = (strcmp(value_str, "1") == 0);
+    } else if (strncmp(line, "ab_tx", key_len) == 0) {
+        g_app_state->ab_translation_x = (float)atof(value_str);
+    } else if (strncmp(line, "ab_ty", key_len) == 0) {
+        g_app_state->ab_translation_y = (float)atof(value_str);
+    } else if (strncmp(line, "ab_rot", key_len) == 0) {
+        g_app_state->ab_rotation_deg = (float)atof(value_str);
+    } else if (strncmp(line, "ab_sx", key_len) == 0) {
+        g_app_state->ab_scale_x = (float)atof(value_str);
+    } else if (strncmp(line, "ab_sy", key_len) == 0) {
+        g_app_state->ab_scale_y = (float)atof(value_str);
+    } else if (strncmp(line, "bc_tx", key_len) == 0) {
+        g_app_state->bc_translation_x = (float)atof(value_str);
+    } else if (strncmp(line, "bc_ty", key_len) == 0) {
+        g_app_state->bc_translation_y = (float)atof(value_str);
+    } else if (strncmp(line, "bc_rot", key_len) == 0) {
+        g_app_state->bc_rotation_deg = (float)atof(value_str);
+    } else if (strncmp(line, "bc_sx", key_len) == 0) {
+        g_app_state->bc_scale_x = (float)atof(value_str);
+    } else if (strncmp(line, "bc_sy", key_len) == 0) {
+        g_app_state->bc_scale_y = (float)atof(value_str);
+    }
+}
+
+void ManualAdjustments_WriteAll(ImGuiContext*, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buf) {
+    if (!g_app_state) return;
+    
+    buf->appendf("[%s][Data]\n", handler->TypeName);
+    buf->appendf("manual_enabled=%d\n", g_app_state->manual_adjustments_enabled ? 1 : 0);
+    buf->appendf("auto_update=%d\n", g_app_state->auto_update_enabled ? 1 : 0);
+    buf->appendf("ab_tx=%.3f\n", g_app_state->ab_translation_x);
+    buf->appendf("ab_ty=%.3f\n", g_app_state->ab_translation_y);
+    buf->appendf("ab_rot=%.3f\n", g_app_state->ab_rotation_deg);
+    buf->appendf("ab_sx=%.6f\n", g_app_state->ab_scale_x);
+    buf->appendf("ab_sy=%.6f\n", g_app_state->ab_scale_y);
+    buf->appendf("bc_tx=%.3f\n", g_app_state->bc_translation_x);
+    buf->appendf("bc_ty=%.3f\n", g_app_state->bc_translation_y);
+    buf->appendf("bc_rot=%.3f\n", g_app_state->bc_rotation_deg);
+    buf->appendf("bc_sx=%.6f\n", g_app_state->bc_scale_x);
+    buf->appendf("bc_sy=%.6f\n", g_app_state->bc_scale_y);
+    buf->append("\n");
+}
+
+void RegisterManualAdjustmentsHandler(ApplicationState* app_state) {
+    g_app_state = app_state;
+    
+    ImGuiSettingsHandler ini_handler;
+    ini_handler.TypeName = "ManualAdjustments";
+    ini_handler.TypeHash = ImHashStr("ManualAdjustments");
+    ini_handler.ReadOpenFn = ManualAdjustments_ReadOpen;
+    ini_handler.ReadLineFn = ManualAdjustments_ReadLine;
+    ini_handler.WriteAllFn = ManualAdjustments_WriteAll;
+    ImGui::AddSettingsHandler(&ini_handler);
 }
 
 // --- GUI DRAWING FUNCTIONS ---
@@ -211,5 +353,123 @@ void DrawStatusPanel(ApplicationState& state) {
     ImGui::Text("Current Status:");
     ImGui::TextWrapped("%s", state.status_message.c_str());
 
+    ImGui::End();
+}
+
+void DrawManualAdjustmentsPanel(ApplicationState& state) {
+    ImGui::Begin("Manual Adjustments");
+    
+    // Main toggle for manual adjustments
+    if (ImGui::Checkbox("Enable Manual Adjustments", &state.manual_adjustments_enabled)) {
+        if (state.auto_update_enabled && state.stitching_initialized) {
+            state.UpdatePanoramaWithAdjustments();
+        }
+    }
+    
+    ImGui::SameLine();
+    ImGui::Checkbox("Auto Update", &state.auto_update_enabled);
+    
+    if (!state.manual_adjustments_enabled) {
+        ImGui::BeginDisabled();
+    }
+    
+    ImGui::Separator();
+    ImGui::Text("Blending Mode (Real-time)");
+    if (ImGui::Combo("##BlendingMode", &state.selected_blending_mode, state.blending_modes, IM_ARRAYSIZE(state.blending_modes))) {
+        if (state.auto_update_enabled && state.stitching_initialized) {
+            state.UpdatePanoramaWithAdjustments();
+        }
+    }
+    
+    ImGui::Separator();
+    ImGui::Text("AB Transform (Izquierda -> Central)");
+    
+    bool ab_changed = false;
+    
+    if (ImGui::SliderFloat("AB Translation X", &state.ab_translation_x, -200.0f, 200.0f, "%.1f px")) {
+        ab_changed = true;
+    }
+    if (ImGui::SliderFloat("AB Translation Y", &state.ab_translation_y, -200.0f, 200.0f, "%.1f px")) {
+        ab_changed = true;
+    }
+    if (ImGui::SliderFloat("AB Rotation", &state.ab_rotation_deg, -10.0f, 10.0f, "%.2f deg")) {
+        ab_changed = true;
+    }
+    if (ImGui::SliderFloat("AB Scale X", &state.ab_scale_x, 0.9f, 1.1f, "%.4f")) {
+        ab_changed = true;
+    }
+    if (ImGui::SliderFloat("AB Scale Y", &state.ab_scale_y, 0.9f, 1.1f, "%.4f")) {
+        ab_changed = true;
+    }
+    
+    if (ImGui::Button("Reset AB")) {
+        state.ab_translation_x = 0.0f;
+        state.ab_translation_y = 0.0f;
+        state.ab_rotation_deg = 0.0f;
+        state.ab_scale_x = 1.0f;
+        state.ab_scale_y = 1.0f;
+        ab_changed = true;
+    }
+    
+    ImGui::Separator();
+    ImGui::Text("BC Transform (Derecha -> Central)");
+    
+    bool bc_changed = false;
+    
+    if (ImGui::SliderFloat("BC Translation X", &state.bc_translation_x, -200.0f, 200.0f, "%.1f px")) {
+        bc_changed = true;
+    }
+    if (ImGui::SliderFloat("BC Translation Y", &state.bc_translation_y, -200.0f, 200.0f, "%.1f px")) {
+        bc_changed = true;
+    }
+    if (ImGui::SliderFloat("BC Rotation", &state.bc_rotation_deg, -10.0f, 10.0f, "%.2f deg")) {
+        bc_changed = true;
+    }
+    if (ImGui::SliderFloat("BC Scale X", &state.bc_scale_x, 0.9f, 1.1f, "%.4f")) {
+        bc_changed = true;
+    }
+    if (ImGui::SliderFloat("BC Scale Y", &state.bc_scale_y, 0.9f, 1.1f, "%.4f")) {
+        bc_changed = true;
+    }
+    
+    if (ImGui::Button("Reset BC")) {
+        state.bc_translation_x = 0.0f;
+        state.bc_translation_y = 0.0f;
+        state.bc_rotation_deg = 0.0f;
+        state.bc_scale_x = 1.0f;
+        state.bc_scale_y = 1.0f;
+        bc_changed = true;
+    }
+    
+    ImGui::Separator();
+    if (ImGui::Button("Reset All Adjustments", ImVec2(-1, 0))) {
+        state.ab_translation_x = 0.0f;
+        state.ab_translation_y = 0.0f;
+        state.ab_rotation_deg = 0.0f;
+        state.ab_scale_x = 1.0f;
+        state.ab_scale_y = 1.0f;
+        state.bc_translation_x = 0.0f;
+        state.bc_translation_y = 0.0f;
+        state.bc_rotation_deg = 0.0f;
+        state.bc_scale_x = 1.0f;
+        state.bc_scale_y = 1.0f;
+        ab_changed = bc_changed = true;
+    }
+    
+    if (ImGui::Button("Manual Update", ImVec2(-1, 0))) {
+        if (state.stitching_initialized) {
+            state.UpdatePanoramaWithAdjustments();
+        }
+    }
+    
+    // Auto-update on change
+    if ((ab_changed || bc_changed) && state.auto_update_enabled && state.stitching_initialized) {
+        state.UpdatePanoramaWithAdjustments();
+    }
+    
+    if (!state.manual_adjustments_enabled) {
+        ImGui::EndDisabled();
+    }
+    
     ImGui::End();
 }
