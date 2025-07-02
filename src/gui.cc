@@ -247,18 +247,27 @@ void DrawStitchingSetupPanel(ApplicationState& state) {
     ImGui::Combo("Mode", &state.selected_blending_mode, state.blending_modes, IM_ARRAYSIZE(state.blending_modes));
 
     ImGui::Separator();
-    ImGui::Text("Viewer Options");
-    if (ImGui::SliderFloat("Rotation", &state.rotation_degrees, -180.0f, 180.0f, "%.1f deg")) {
-        // Snap to right angles
-        const float snap_threshold = 2.0f; // Degrees
-        const float angles[] = {-180.0f, -90.0f, 0.0f, 90.0f, 180.0f};
-        for (float angle : angles) {
-            if (fabs(state.rotation_degrees - angle) < snap_threshold) {
-                state.rotation_degrees = angle;
-                break;
-            }
-        }
+    ImGui::Text("Viewer Orientation");
+    
+    // Four orientation buttons
+    if (ImGui::Button("Normal (0°)")) {
+        state.rotation_degrees = 0.0f;
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Right (90°)")) {
+        state.rotation_degrees = 90.0f;
+    }
+    
+    if (ImGui::Button("Inverted (180°)")) {
+        state.rotation_degrees = 180.0f;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Left (-90°)")) {
+        state.rotation_degrees = -90.0f;
+    }
+    
+    // Show current rotation
+    ImGui::Text("Current: %.1f°", state.rotation_degrees);
 
     ImGui::Separator();
     ImGui::Text("3. Actions");
@@ -386,19 +395,19 @@ void DrawManualAdjustmentsPanel(ApplicationState& state) {
     
     bool ab_changed = false;
     
-    if (ImGui::SliderFloat("AB Translation X", &state.ab_translation_x, -200.0f, 200.0f, "%.1f px")) {
+    if (ImGui::DragFloat("AB Translation X", &state.ab_translation_x, 0.1f, -200.0f, 200.0f, "%.1f px")) {
         ab_changed = true;
     }
-    if (ImGui::SliderFloat("AB Translation Y", &state.ab_translation_y, -200.0f, 200.0f, "%.1f px")) {
+    if (ImGui::DragFloat("AB Translation Y", &state.ab_translation_y, 0.1f, -200.0f, 200.0f, "%.1f px")) {
         ab_changed = true;
     }
-    if (ImGui::SliderFloat("AB Rotation", &state.ab_rotation_deg, -10.0f, 10.0f, "%.2f deg")) {
+    if (ImGui::DragFloat("AB Rotation", &state.ab_rotation_deg, 0.01f, -10.0f, 10.0f, "%.2f deg")) {
         ab_changed = true;
     }
-    if (ImGui::SliderFloat("AB Scale X", &state.ab_scale_x, 0.9f, 1.1f, "%.4f")) {
+    if (ImGui::DragFloat("AB Scale X", &state.ab_scale_x, 0.0001f, 0.9f, 1.1f, "%.4f")) {
         ab_changed = true;
     }
-    if (ImGui::SliderFloat("AB Scale Y", &state.ab_scale_y, 0.9f, 1.1f, "%.4f")) {
+    if (ImGui::DragFloat("AB Scale Y", &state.ab_scale_y, 0.0001f, 0.9f, 1.1f, "%.4f")) {
         ab_changed = true;
     }
     
@@ -416,19 +425,19 @@ void DrawManualAdjustmentsPanel(ApplicationState& state) {
     
     bool bc_changed = false;
     
-    if (ImGui::SliderFloat("BC Translation X", &state.bc_translation_x, -200.0f, 200.0f, "%.1f px")) {
+    if (ImGui::DragFloat("BC Translation X", &state.bc_translation_x, 0.1f, -200.0f, 200.0f, "%.1f px")) {
         bc_changed = true;
     }
-    if (ImGui::SliderFloat("BC Translation Y", &state.bc_translation_y, -200.0f, 200.0f, "%.1f px")) {
+    if (ImGui::DragFloat("BC Translation Y", &state.bc_translation_y, 0.1f, -200.0f, 200.0f, "%.1f px")) {
         bc_changed = true;
     }
-    if (ImGui::SliderFloat("BC Rotation", &state.bc_rotation_deg, -10.0f, 10.0f, "%.2f deg")) {
+    if (ImGui::DragFloat("BC Rotation", &state.bc_rotation_deg, 0.01f, -10.0f, 10.0f, "%.2f deg")) {
         bc_changed = true;
     }
-    if (ImGui::SliderFloat("BC Scale X", &state.bc_scale_x, 0.9f, 1.1f, "%.4f")) {
+    if (ImGui::DragFloat("BC Scale X", &state.bc_scale_x, 0.0001f, 0.9f, 1.1f, "%.4f")) {
         bc_changed = true;
     }
-    if (ImGui::SliderFloat("BC Scale Y", &state.bc_scale_y, 0.9f, 1.1f, "%.4f")) {
+    if (ImGui::DragFloat("BC Scale Y", &state.bc_scale_y, 0.0001f, 0.9f, 1.1f, "%.4f")) {
         bc_changed = true;
     }
     
