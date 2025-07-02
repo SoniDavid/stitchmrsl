@@ -14,12 +14,20 @@ void MatToTexture(const cv::Mat& mat, GLuint& texture_id) {
     // Set texture filtering parameters
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    // Convert BGR to RGB
+    // Convert BGR to RGB and ensure continuous memory layout
     cv::Mat rgb_mat;
     cv::cvtColor(mat, rgb_mat, cv::COLOR_BGR2RGB);
+    
+    // Ensure the image is continuous in memory
+    if (!rgb_mat.isContinuous()) {
+        rgb_mat = rgb_mat.clone();
+    }
 
-    // Upload pixels
+    // Upload pixels with correct alignment
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, rgb_mat.cols, rgb_mat.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, rgb_mat.data);
 }
 
@@ -167,7 +175,17 @@ void DrawImageViewerPanel(ApplicationState& state) {
             pos[i].y = center_pos.y + (p.x - center_pos.x) * sin_a + (p.y - center_pos.y) * cos_a;
         }
 
-        draw_list->AddImageQuad((void*)(intptr_t)state.stitched_texture_id, pos[0], pos[1], pos[2], pos[3]);
+        // UV coordinates for the texture (always in order: top-left, top-right, bottom-right, bottom-left)
+        ImVec2 uv[4] = {
+            ImVec2(0.0f, 0.0f), // top-left
+            ImVec2(1.0f, 0.0f), // top-right
+            ImVec2(1.0f, 1.0f), // bottom-right
+            ImVec2(0.0f, 1.0f)  // bottom-left
+        };
+        
+        draw_list->AddImageQuad((void*)(intptr_t)state.stitched_texture_id, 
+                                pos[0], pos[1], pos[2], pos[3],
+                                uv[0], uv[1], uv[2], uv[3]);
 
     } else {
         ImGui::TextWrapped("Output will be displayed here. The final image will also be saved as 'panorama_result.jpg' in the executable's directory.");

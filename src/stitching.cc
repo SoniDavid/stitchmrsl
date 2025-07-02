@@ -75,44 +75,37 @@ bool StitchingPipeline::LoadExtrinsicsData(const std::string& extrinsics_path) {
     file >> extrinsics_json;
 
     try {
-        auto results = extrinsics_json["results"];
+        auto best_transforms_json = extrinsics_json["best_transforms"];
+        auto results_json = extrinsics_json["results"];
 
         // Load AB transform (central -> izquierda)
-        if (results.contains("AB_similarity")) {
-            auto ab_data = results["AB_similarity"];
-            loaded_ab_transform_.mean_error = ab_data["mean_error"];
-            double rotation_rad = ab_data["rotation_deg"].get<double>() * M_PI / 180.0;
-            double scale = ab_data["scale"].get<double>();
-            double tx = ab_data["translation_x"].get<double>();
-            double ty = ab_data["translation_y"].get<double>();
-            loaded_ab_transform_.similarity = cv::Mat::zeros(2, 3, CV_64F);
-            loaded_ab_transform_.similarity.at<double>(0, 0) = scale * cos(rotation_rad);
-            loaded_ab_transform_.similarity.at<double>(0, 1) = -scale * sin(rotation_rad);
-            loaded_ab_transform_.similarity.at<double>(0, 2) = tx;
-            loaded_ab_transform_.similarity.at<double>(1, 0) = scale * sin(rotation_rad);
-            loaded_ab_transform_.similarity.at<double>(1, 1) = scale * cos(rotation_rad);
-            loaded_ab_transform_.similarity.at<double>(1, 2) = ty;
+        if (best_transforms_json.contains("AB_similarity") && results_json.contains("AB_similarity")) {
+            cv::Mat ab_matrix_3x3(3, 3, CV_64F);
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    ab_matrix_3x3.at<double>(i, j) = best_transforms_json["AB_similarity"][i][j];
+                }
+            }
+            // Extract the 2x3 similarity part
+            loaded_ab_transform_.similarity = ab_matrix_3x3(cv::Rect(0, 0, 3, 2)).clone();
+            loaded_ab_transform_.mean_error = results_json["AB_similarity"]["mean_error"].get<double>();
             loaded_ab_transform_.valid = true;
-            std::cout << "✓ Loaded AB similarity transform" << std::endl;
+            std::cout << "✓ Loaded AB similarity transform from best_transforms" << std::endl;
         }
 
         // Load BC transform (derecha -> central)
-        if (results.contains("BC_similarity")) {
-            auto bc_data = results["BC_similarity"];
-            loaded_bc_transform_.mean_error = bc_data["mean_error"];
-            double rotation_rad = bc_data["rotation_deg"].get<double>() * M_PI / 180.0;
-            double scale = bc_data["scale"].get<double>();
-            double tx = bc_data["translation_x"].get<double>();
-            double ty = bc_data["translation_y"].get<double>();
-            loaded_bc_transform_.similarity = cv::Mat::zeros(2, 3, CV_64F);
-            loaded_bc_transform_.similarity.at<double>(0, 0) = scale * cos(rotation_rad);
-            loaded_bc_transform_.similarity.at<double>(0, 1) = -scale * sin(rotation_rad);
-            loaded_bc_transform_.similarity.at<double>(0, 2) = tx;
-            loaded_bc_transform_.similarity.at<double>(1, 0) = scale * sin(rotation_rad);
-            loaded_bc_transform_.similarity.at<double>(1, 1) = scale * cos(rotation_rad);
-            loaded_bc_transform_.similarity.at<double>(1, 2) = ty;
+        if (best_transforms_json.contains("BC_similarity") && results_json.contains("BC_similarity")) {
+            cv::Mat bc_matrix_3x3(3, 3, CV_64F);
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    bc_matrix_3x3.at<double>(i, j) = best_transforms_json["BC_similarity"][i][j];
+                }
+            }
+            // Extract the 2x3 similarity part
+            loaded_bc_transform_.similarity = bc_matrix_3x3(cv::Rect(0, 0, 3, 2)).clone();
+            loaded_bc_transform_.mean_error = results_json["BC_similarity"]["mean_error"].get<double>();
             loaded_bc_transform_.valid = true;
-            std::cout << "✓ Loaded BC similarity transform" << std::endl;
+            std::cout << "✓ Loaded BC similarity transform from best_transforms" << std::endl;
         }
 
     } catch (const std::exception& e) {
