@@ -33,7 +33,7 @@ set(SOURCES
     src/main.cc
     src/gui.cc
     src/stitching.cc
-    src/render.cc
+    # src/render.cc
     include/gui.hh
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_demo.cpp
@@ -51,7 +51,7 @@ add_executable(${PROJECT_NAME} ${SOURCES})
 # Find required packages
 find_package(PkgConfig REQUIRED)
 find_package(OpenGL REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d objdetect aruco)
 find_package(glm REQUIRED)
 
 # FIXED: Find nlohmann/json

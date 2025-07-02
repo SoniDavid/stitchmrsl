@@ -1,52 +1,57 @@
-#include "app.hh"
+#ifndef GUI_HH
+#define GUI_HH
 
-#include "imgui.h"
-#include "imgui_impl_glfw.h"
-#include "imgui_impl_opengl3.h"
-#include <stdio.h>
-#include <chrono>
-#include <string>
-#include <cmath>
-#define GL_SILENCE_DEPRECATION
-#if defined(IMGUI_IMPL_OPENGL_ES2)
-#include <GLES2/gl2.h>
-#endif
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
 #include <GLFW/glfw3.h>
+#include <opencv2/opencv.hpp>
+#include "stitching.hh"
 
-#if defined(_MSC_VER) && (_MSC_VER >= 1900) && !defined(IMGUI_DISABLE_WIN32_FUNCTIONS)
-#pragma comment(lib, "legacy_stdio_definitions")
-#endif
+// Helper to convert cv::Mat to an OpenGL texture for ImGui
+void MatToTexture(const cv::Mat& mat, GLuint& texture_id);
 
-#ifdef __EMSCRIPTEN__
-#include "../libs/emscripten/emscripten_mainloop_stub.h"
-#endif
+// --- APPLICATION STATE ---
+struct ApplicationState {
+    // Stitching Pipeline
+    std::unique_ptr<StitchingPipeline> pipeline;
+    bool stitching_initialized = false;
+    
+    // File Paths
+    char intrinsics_file_path[256] = "intrinsic.json";
+    char extrinsics_file_path[256] = "extrinsic.json";
+    char test_image_paths[3][256] = {
+        "imgs/izquierda.jpg",
+        "imgs/central.jpg",
+        "imgs/derecha.jpg"
+    };
+    const char* camera_names[3] = {"Izquierda", "Central", "Derecha"};
 
-void DrawStitchingInitPanel(ApplicationState& state);
-void DrawAdvancedStitchingPanel(ApplicationState& state);
-void DrawStitchedMainViewport(ApplicationState& state);
-void DrawStitchingDebugWindow(ApplicationState& state);
-void DrawMainMenuBarWithStitching(ApplicationState& state);
+    // Status
+    bool calibration_loaded = false;
+    bool test_images_loaded = false;
+    std::string status_message = "Initialize pipeline to begin.";
 
-// Helper function to get current time in seconds
-float GetTime();
+    // Output
+    cv::Mat stitched_mat;
+    GLuint stitched_texture_id = 0;
 
-// Main menu bar
-void DrawMainMenuBar(ApplicationState& state);
+    // Blending Options
+    int selected_blending_mode = 1; // Default to Feathering
+    const char* blending_modes[2] = {"Average", "Feathering"};
 
-// Camera control panel
-void DrawCameraControls(ApplicationState& state);
+    // Viewer Options
+    float rotation_degrees = 0.0f;
 
-// Main viewport window
-void DrawMainViewport(ApplicationState& state);
+    // --- METHODS ---
+    void InitializeStitching();
+    void CreatePanorama();
+    void ResetStitching();
+};
 
-// Stitching settings panel
-void DrawStitchingPanel(ApplicationState& state);
+// --- GUI DRAWING FUNCTIONS ---
+void DrawStitchingSetupPanel(ApplicationState& state);
+void DrawImageViewerPanel(ApplicationState& state);
+void DrawStatusPanel(ApplicationState& state);
 
-// Performance monitoring window
-void DrawPerformanceWindow(ApplicationState& state);
-
-// Debug information window
-void DrawDebugWindow(ApplicationState& state);
-
-// Modal dialogs
-void DrawModalDialogs(ApplicationState& state);
+#endif // GUI_HH
