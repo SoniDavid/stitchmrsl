@@ -831,11 +831,16 @@ def main():
     
     # Save comprehensive results
     output_file = os.path.join(OUTPUT_DIR, 'stereo_stitching_results.json')
+    
+    # Convert numpy arrays in best_transforms to lists for JSON serialization
+    serializable_transforms = {k: v.tolist() for k, v in best_transforms.items()}
+
     with open(output_file, 'w') as f:
         json.dump({
             'processed_pairs': list(stereo_pairs.keys()),
             'total_image_pairs': sum(len(p['image_pairs']) for p in stereo_pairs.values()),
             'results': results,
+            'best_transforms': serializable_transforms, # Added best_transforms
             'stitched_images_created': list(stitched_images.keys())
         }, f, indent=2)
     
