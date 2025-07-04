@@ -76,6 +76,7 @@ struct ApplicationState {
     void UpdatePanoramaWithAdjustments();
     void ApplyInitialAdjustments();
     bool CaptureRTSPFrames();
+    void UpdateRTSPFramesAndPanorama();
 };
 
 // --- IMGUI SETTINGS HANDLER FUNCTIONS ---

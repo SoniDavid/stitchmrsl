@@ -192,6 +192,32 @@ bool ApplicationState::CaptureRTSPFrames() {
     return all_success;
 }
 
+void ApplicationState::UpdateRTSPFramesAndPanorama() {
+    if (!use_rtsp_streams || !stitching_initialized) return;
+
+    std::vector<cv::Mat> frames;
+    bool all_success = true;
+
+    for (int i = 0; i < 3; ++i) {
+        cv::Mat frame;
+        if (!rtsp_caps[i].read(frame) || frame.empty()) {
+            status_message = "Failed to read frame from RTSP stream: " + std::string(rtsp_urls[i]);
+            all_success = false;
+            break;
+        }
+        frames.push_back(frame);
+    }
+
+    if (all_success) {
+        pipeline->SetBlendingMode(static_cast<BlendingMode>(selected_blending_mode));
+        pipeline->LoadTestImagesFromMats(frames);
+        stitched_mat = pipeline->CreatePanoramaFromPrecomputed();
+        if (!stitched_mat.empty()) {
+            MatToTexture(stitched_mat, stitched_texture_id);
+        }
+    }
+}
+
 
 void ManualAdjustments_ReadLine(ImGuiContext*, ImGuiSettingsHandler*, void* entry, const char* line) {
     if (!entry || !g_app_state) return;

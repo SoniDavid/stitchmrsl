@@ -1,6 +1,7 @@
 #include <GL/gl3w.h>
 #include "gui.hh"
 #include <iostream>
+#include <chrono> 
 
 static void glfw_error_callback(int error, const char* description) {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
@@ -78,6 +79,9 @@ int main(int, char**) {
     // Register custom settings handler for manual adjustments
     RegisterManualAdjustmentsHandler(&app_state);
 
+    // Initialize last RTSP update timestamp
+    std::chrono::steady_clock::time_point last_rtsp_update = std::chrono::steady_clock::now();
+
     // Main loop
     while (!glfwWindowShouldClose(window))
     {
@@ -88,6 +92,14 @@ int main(int, char**) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         
+        // RTSP Stream Update 
+        auto now = std::chrono::steady_clock::now();
+        if (app_state.use_rtsp_streams && app_state.stitching_initialized &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_rtsp_update).count() > 100) {
+            app_state.UpdateRTSPFramesAndPanorama();
+            last_rtsp_update = now;
+        }
+
         // Enable docking
         ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
 
