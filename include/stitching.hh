@@ -49,6 +49,7 @@ public:
     bool LoadIntrinsicsData(const std::string& intrinsics_path);
     bool LoadExtrinsicsData(const std::string& extrinsics_path);
     bool LoadTestImages(const std::vector<std::string>& image_paths);
+    bool LoadTestImagesFromMats(const std::vector<cv::Mat>& images);
 
     // --- CORE STITCHING LOGIC ---
     cv::Mat CreatePanoramaFromPrecomputed();

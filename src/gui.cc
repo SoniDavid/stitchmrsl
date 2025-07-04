@@ -39,9 +39,13 @@ void ApplicationState::InitializeStitching() {
     calibration_loaded = pipeline->LoadIntrinsicsData(intrinsics_file_path) &&
                          pipeline->LoadExtrinsicsData(extrinsics_file_path);
 
-    std::vector<std::string> paths;
-    for(int i=0; i<3; ++i) paths.push_back(test_image_paths[i]);
-    test_images_loaded = pipeline->LoadTestImages(paths);
+    if (use_rtsp_streams) {
+        test_images_loaded = CaptureRTSPFrames();
+    } else {
+        std::vector<std::string> paths;
+        for(int i=0; i<3; ++i) paths.push_back(test_image_paths[i]);
+        test_images_loaded = pipeline->LoadTestImages(paths);
+    }
 
     if (calibration_loaded && test_images_loaded) {
         stitching_initialized = true;
@@ -156,6 +160,38 @@ void* ManualAdjustments_ReadOpen(ImGuiContext*, ImGuiSettingsHandler*, const cha
     }
     return nullptr;
 }
+
+bool ApplicationState::CaptureRTSPFrames() {
+    bool all_success = true;
+    std::vector<cv::Mat> frames;
+
+    for (int i = 0; i < 3; ++i) {
+        if (!rtsp_caps[i].isOpened()) {
+            rtsp_caps[i].open(rtsp_urls[i]);
+            if (!rtsp_caps[i].isOpened()) {
+                status_message = "Failed to open RTSP stream: " + std::string(rtsp_urls[i]);
+                all_success = false;
+                break;
+            }
+        }
+
+        cv::Mat frame;
+        if (!rtsp_caps[i].read(frame) || frame.empty()) {
+            status_message = "Failed to read frame from RTSP: " + std::string(rtsp_urls[i]);
+            all_success = false;
+            break;
+        }
+        frames.push_back(frame);
+    }
+
+    if (all_success) {
+        test_images_loaded = pipeline->LoadTestImagesFromMats(frames);  // necesitas implementar este método
+        status_message = "RTSP frames captured and loaded!";
+    }
+
+    return all_success;
+}
+
 
 void ManualAdjustments_ReadLine(ImGuiContext*, ImGuiSettingsHandler*, void* entry, const char* line) {
     if (!entry || !g_app_state) return;
@@ -480,5 +516,29 @@ void DrawManualAdjustmentsPanel(ApplicationState& state) {
         ImGui::EndDisabled();
     }
     
+    ImGui::End();
+}
+
+void DrawRTSPPanel(ApplicationState& state) {
+    ImGui::Begin("RTSP Configuration");
+
+    ImGui::Checkbox("Use RTSP Streams Instead of Static Images", &state.use_rtsp_streams);
+
+    if (state.use_rtsp_streams) {
+        for (int i = 0; i < 3; ++i) {
+            ImGui::PushID(i);
+            ImGui::InputText(state.camera_names[i], state.rtsp_urls[i], sizeof(state.rtsp_urls[i]));
+            ImGui::PopID();
+        }
+        if (ImGui::Button("Reconnect Streams")) {
+            // Cerrar previos si abiertos
+            for (int i = 0; i < 3; ++i) {
+                if (state.rtsp_caps[i].isOpened())
+                    state.rtsp_caps[i].release();
+            }
+            state.CaptureRTSPFrames();
+        }
+    }
+
     ImGui::End();
 }

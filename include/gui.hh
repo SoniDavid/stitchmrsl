@@ -26,6 +26,13 @@ struct ApplicationState {
         "imgs/central.jpg",
         "imgs/derecha.jpg"
     };
+
+    //RTPS 
+    char rtsp_urls[3][512] = { "", "", "" };
+    bool use_rtsp_streams = false;
+    cv::VideoCapture rtsp_caps[3];  // Para acceder a los streams en tiempo real
+
+    
     const char* camera_names[3] = {"Izquierda", "Central", "Derecha"};
 
     // Status
@@ -68,6 +75,7 @@ struct ApplicationState {
     void ResetStitching();
     void UpdatePanoramaWithAdjustments();
     void ApplyInitialAdjustments();
+    bool CaptureRTSPFrames();
 };
 
 // --- IMGUI SETTINGS HANDLER FUNCTIONS ---
@@ -81,5 +89,6 @@ void DrawStitchingSetupPanel(ApplicationState& state);
 void DrawImageViewerPanel(ApplicationState& state);
 void DrawStatusPanel(ApplicationState& state);
 void DrawManualAdjustmentsPanel(ApplicationState& state);
+void DrawRTSPPanel(ApplicationState& state);
 
 #endif // GUI_HH

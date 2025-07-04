@@ -135,6 +135,27 @@ bool StitchingPipeline::LoadTestImages(const std::vector<std::string>& image_pat
     return true;
 }
 
+bool StitchingPipeline::LoadTestImagesFromMats(const std::vector<cv::Mat>& images) {
+    if (images.size() != 3) {
+        std::cerr << "Expected 3 images for stitching. Got " << images.size() << std::endl;
+        return false;
+    }
+
+    test_images_.clear();
+    for (const auto& img : images) {
+        if (img.empty()) {
+            std::cerr << "One of the provided RTSP images is empty." << std::endl;
+            test_images_.clear();
+            return false;
+        }
+        test_images_.push_back(img.clone());  // Store a copy
+    }
+
+    std::cout << "RTSP images loaded into stitching pipeline." << std::endl;
+    return true;
+}
+
+
 cv::Mat StitchingPipeline::CreatePanoramaFromPrecomputed() {
     if (cameras_.size() != 3 || test_images_.size() != 3 || !loaded_ab_transform_.valid || !loaded_bc_transform_.valid) {
         std::cerr << "ERROR: Prerequisites for stitching not met. Load all data first." << std::endl;

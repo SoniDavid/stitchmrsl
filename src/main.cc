@@ -96,6 +96,7 @@ int main(int, char**) {
         DrawImageViewerPanel(app_state);
         DrawStatusPanel(app_state);
         DrawManualAdjustmentsPanel(app_state);
+        DrawRTSPPanel(app_state);
 
         // Rendering
         ImGui::Render();
