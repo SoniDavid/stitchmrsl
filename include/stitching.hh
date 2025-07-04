@@ -57,7 +57,8 @@ public:
 
 private:
     // --- HELPER METHODS ---
-    cv::Mat RectifyImageFisheye(const cv::Mat& image, const CameraIntrinsics& intrinsics);
+    void PrecomputeRectificationMaps();
+    cv::Mat RectifyImageFisheye(const cv::Mat& image, const std::string& name, const CameraIntrinsics& intrinsics);
     void BlendInPlace(cv::Mat& base, const cv::Mat& overlay, BlendingMode mode);
 
 
@@ -70,6 +71,11 @@ private:
     // Pre-computed transformations loaded from JSON
     PrecomputedTransform loaded_ab_transform_; // izquierda -> central
     PrecomputedTransform loaded_bc_transform_; // central -> derecha
+
+    // Rectification Maps
+    std::map<std::string, cv::Mat> map1_;
+    std::map<std::string, cv::Mat> map2_;
+    bool maps_ready_ = false;
 };
 
 #endif // STITCHING_HH

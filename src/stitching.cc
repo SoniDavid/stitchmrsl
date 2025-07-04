@@ -62,6 +62,7 @@ bool StitchingPipeline::LoadIntrinsicsData(const std::string& intrinsics_path) {
         std::cerr << "Error parsing intrinsics JSON: " << e.what() << std::endl;
         return false;
     }
+    PrecomputeRectificationMaps();
     return true;
 }
 
@@ -145,7 +146,7 @@ cv::Mat StitchingPipeline::CreatePanoramaFromPrecomputed() {
     // 1. Rectify all three images
     rectified_images_.clear();
     for (size_t i = 0; i < test_images_.size(); ++i) {
-        rectified_images_.push_back(RectifyImageFisheye(test_images_[i], cameras_[i].intrinsics));
+        rectified_images_.push_back(RectifyImageFisheye(test_images_[i], cameras_[i].name, cameras_[i].intrinsics));
     }
     cv::Mat& img_izq = rectified_images_[0];
     cv::Mat& img_central = rectified_images_[1];
@@ -247,7 +248,7 @@ cv::Mat StitchingPipeline::CreatePanoramaWithCustomTransforms(const cv::Mat& cus
     if (rectified_images_.size() != 3) {
         rectified_images_.clear();
         for (size_t i = 0; i < test_images_.size(); ++i) {
-            rectified_images_.push_back(RectifyImageFisheye(test_images_[i], cameras_[i].intrinsics));
+            rectified_images_.push_back(RectifyImageFisheye(test_images_[i], cameras_[i].name, cameras_[i].intrinsics));
         }
     }
     cv::Mat& img_izq = rectified_images_[0];
@@ -360,6 +361,44 @@ void StitchingPipeline::SetBlendingMode(BlendingMode mode) {
 
 // --- PRIVATE HELPER METHODS ---
 
+void StitchingPipeline::PrecomputeRectificationMaps() {
+    map1_.clear();
+    map2_.clear();
+
+    for (const auto& cam : cameras_) {
+        cv::Mat map1, map2;
+        cv::Mat R = cv::Mat::eye(3, 3, CV_64F);  // No rectification rotation
+        cv::Size size(cam.intrinsics.image_width, cam.intrinsics.image_height);
+
+        cv::Mat new_K;
+        cv::fisheye::estimateNewCameraMatrixForUndistortRectify(
+        cam.intrinsics.camera_matrix,
+        cam.intrinsics.distortion_coeffs,
+        size,
+        R,
+        new_K,
+        0.4  // balance, adjust if needed
+    );
+
+        cv::fisheye::initUndistortRectifyMap(
+            cam.intrinsics.camera_matrix,
+            cam.intrinsics.distortion_coeffs,
+            R,
+            new_K,  // You can use new_K for zooming out/in
+            size,
+            CV_16SC2,
+            map1,
+            map2
+        );
+
+        map1_[cam.name] = map1;
+        map2_[cam.name] = map2;
+    }
+
+    maps_ready_ = true;
+}
+
+
 void StitchingPipeline::BlendInPlace(cv::Mat& base, const cv::Mat& overlay, BlendingMode mode) {
     if (base.empty() || overlay.empty()) return;
 
@@ -426,20 +465,13 @@ void StitchingPipeline::BlendInPlace(cv::Mat& base, const cv::Mat& overlay, Blen
     }
 }
 
-cv::Mat StitchingPipeline::RectifyImageFisheye(const cv::Mat& image, const CameraIntrinsics& intrinsics) {
-    cv::Mat rectified_image;
-    cv::Mat new_K;
-    cv::Size image_size(image.cols, image.rows);
+cv::Mat StitchingPipeline::RectifyImageFisheye(const cv::Mat& image, const std::string& name, const CameraIntrinsics& intrinsics) {
+    if (!maps_ready_ || map1_.count(name) == 0) {
+        std::cerr << "Rectification maps not ready for: " << intrinsics.model << std::endl;
+        return image.clone();  // Return unrectified image
+    }
 
-    cv::fisheye::estimateNewCameraMatrixForUndistortRectify(
-        intrinsics.camera_matrix, 
-        intrinsics.distortion_coeffs, 
-        image_size, 
-        cv::Mat::eye(3, 3, CV_64F), 
-        new_K, 
-        0.0 // balance=0.0 to see all pixels
-    );
-
-    cv::fisheye::undistortImage(image, rectified_image, intrinsics.camera_matrix, intrinsics.distortion_coeffs, new_K);
-    return rectified_image;
+    cv::Mat rectified;
+    cv::remap(image, rectified, map1_[name], map2_[name], cv::INTER_LINEAR);
+    return rectified;
 }
