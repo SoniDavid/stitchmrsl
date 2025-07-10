@@ -54,6 +54,8 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    int pano_frames_written = 0;
+
     signal(SIGINT, signal_handler);
     fs::create_directory("output");
 
@@ -121,26 +123,34 @@ int main(int argc, char** argv) {
 
             if (!pano.empty()) {
                 if (!pano_writer_ready) {
+                    const auto pano_size = pano.size();
                     string pano_path = "output/panorama_result.mp4";
-                    bool ok = pano_writer.open(pano_path, cv::VideoWriter::fourcc('a','v','c','1'), fps, pano.size());
 
-                    if (!ok || !pano_writer.isOpened()) {
+                    pano_writer.open(pano_path, cv::VideoWriter::fourcc('a','v','c','1'), fps, pano_size);
+                    if (!pano_writer.isOpened()) {
                         cerr << "[WARNING] Could not open .mp4 with avc1 codec. Falling back to .avi (XVID).\n";
                         pano_path = "output/panorama_result.avi";
-                        pano_writer.open(pano_path, cv::VideoWriter::fourcc('X','V','I','D'), fps, pano.size());
+                        pano_writer.open(pano_path, cv::VideoWriter::fourcc('X','V','I','D'), fps, pano_size);
                     }
 
                     if (!pano_writer.isOpened()) {
-                        cerr << "[ERROR] Failed to open panorama output writer.\n";
+                        cerr << "[ERROR] Failed to open panorama writer after fallback.\n";
                         return -1;
                     }
 
                     pano_writer_ready = true;
+                    cout << "[INFO] Panorama writer initialized with size: " << pano_size << endl;
                 }
+
                 pano_writer.write(pano);
+            } else {
+                cerr << "[WARN] Empty pano frame skipped.\n";
             }
         }
+        pano_frames_written++;
     }
+
+    cout << "[INFO] Total panorama frames written: " << pano_frames_written << endl;
 
     for (int i = 0; i < 3; ++i) SaveVideo(buffers[i], raw_paths[i], fps);
     for (int i = 0; i < 3; ++i) SaveVideo(buffers[i], rectified_paths[i], fps);
