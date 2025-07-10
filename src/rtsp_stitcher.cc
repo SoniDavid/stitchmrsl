@@ -78,7 +78,6 @@ int main(int argc, char** argv) {
     }
     for (auto& t : threads) t.join();
 
-    // Rectify and Stitch after capture
     double fps = 15.0;
     StitchingPipeline pipeline;
     if (!pipeline.LoadIntrinsicsData("intrinsic.json") ||
@@ -98,12 +97,9 @@ int main(int argc, char** argv) {
         rectified[1] = pipeline.RectifyImageFisheye(buffers[1][f], "central", pipeline.GetCameraIntrinsicsByName("central"));
         rectified[2] = pipeline.RectifyImageFisheye(buffers[2][f], "derecha", pipeline.GetCameraIntrinsicsByName("derecha"));
 
-        // Save individual rectified frames
         for (int i = 0; i < 3; ++i) buffers[i][f] = rectified[i];
 
-        // Stitch frame
         if (pipeline.LoadTestImagesFromMats(rectified)) {
-            // Apply tuned transform
             cv::Mat ab_custom = cv::Mat::eye(3, 3, CV_64F);
             float ab_rad = 0.800f * CV_PI / 180.0f;
             ab_custom.at<double>(0, 0) = cos(ab_rad) * 0.9877;
@@ -125,11 +121,11 @@ int main(int argc, char** argv) {
 
             if (!pano.empty()) {
                 if (!pano_writer_ready) {
-                    std::string pano_path = "output/panorama_result.mp4";
+                    string pano_path = "output/panorama_result.mp4";
                     bool ok = pano_writer.open(pano_path, cv::VideoWriter::fourcc('a','v','c','1'), fps, pano.size());
 
-                    if (!ok) {
-                        cerr << "[WARNING] Could not open .mp4 with avc1 codec. Falling back to .avi with XVID.\n";
+                    if (!ok || !pano_writer.isOpened()) {
+                        cerr << "[WARNING] Could not open .mp4 with avc1 codec. Falling back to .avi (XVID).\n";
                         pano_path = "output/panorama_result.avi";
                         pano_writer.open(pano_path, cv::VideoWriter::fourcc('X','V','I','D'), fps, pano.size());
                     }
@@ -141,7 +137,6 @@ int main(int argc, char** argv) {
 
                     pano_writer_ready = true;
                 }
-
                 pano_writer.write(pano);
             }
         }

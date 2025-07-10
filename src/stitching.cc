@@ -263,7 +263,7 @@ cv::Mat StitchingPipeline::CreatePanoramaWithCustomTransforms(const cv::Mat& cus
         return cv::Mat();
     }
     
-    std::cout << "=== STARTING PANORAMA CREATION WITH CUSTOM TRANSFORMS ===" << std::endl;
+    // std::cout << "=== STARTING PANORAMA CREATION WITH CUSTOM TRANSFORMS ===" << std::endl;
 
     // 1. Rectify all three images (reuse existing rectified images if available)
     if (rectified_images_.size() != 3) {
@@ -340,7 +340,7 @@ cv::Mat StitchingPipeline::CreatePanoramaWithCustomTransforms(const cv::Mat& cus
     if (blending_mode_ == BlendingMode::AVERAGE) {
         cv::max(warped_izq, warped_central, panorama);
         cv::max(panorama, warped_der, panorama);
-        std::cout << "5. Images blended using cv::max." << std::endl;
+        // std::cout << "5. Images blended using cv::max." << std::endl;
     } else {
         // Use feathering blending
         panorama = warped_central.clone();
