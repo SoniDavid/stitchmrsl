@@ -56,10 +56,14 @@ public:
     cv::Mat CreatePanoramaWithCustomTransforms(const cv::Mat& custom_ab_transform, const cv::Mat& custom_bc_transform);
     void SetBlendingMode(BlendingMode mode);
 
+    const CameraIntrinsics& GetCameraIntrinsicsByName(const std::string& name) const;
+    cv::Mat RectifyImageFisheye(const cv::Mat& image, const std::string& name, const CameraIntrinsics& intrinsics);
+
+
+
 private:
     // --- HELPER METHODS ---
     void PrecomputeRectificationMaps();
-    cv::Mat RectifyImageFisheye(const cv::Mat& image, const std::string& name, const CameraIntrinsics& intrinsics);
     void BlendInPlace(cv::Mat& base, const cv::Mat& overlay, BlendingMode mode);
 
 

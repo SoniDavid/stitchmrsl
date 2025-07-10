@@ -496,3 +496,12 @@ cv::Mat StitchingPipeline::RectifyImageFisheye(const cv::Mat& image, const std::
     cv::remap(image, rectified, map1_[name], map2_[name], cv::INTER_LINEAR);
     return rectified;
 }
+
+const CameraIntrinsics& StitchingPipeline::GetCameraIntrinsicsByName(const std::string& name) const {
+    for (const auto& cam : cameras_) {
+        if (cam.name == name) {
+            return cam.intrinsics;
+        }
+    }
+    throw std::runtime_error("Camera intrinsics not found for: " + name);
+}

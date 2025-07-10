@@ -51,7 +51,7 @@ add_executable(${PROJECT_NAME} ${SOURCES})
 # Find required packages
 find_package(PkgConfig REQUIRED)
 find_package(OpenGL REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d objdetect aruco videoio)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d objdetect aruco videoio highgui)
 find_package(glm REQUIRED)
 
 # FIXED: Find nlohmann/json
@@ -144,8 +144,23 @@ elseif(WIN32)
     target_compile_options(${PROJECT_NAME} PRIVATE ${GLFW3_CFLAGS_OTHER})
 endif()
 
+add_executable(rtsp_stitcher
+    src/rtsp_stitcher.cc
+    src/stitching.cc
+)
+
+target_include_directories(rtsp_stitcher PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+    ${NLOHMANN_JSON_INCLUDE_DIR}
+)
+
+target_link_libraries(rtsp_stitcher
+    ${OpenCV_LIBS}
+)
+
 # Print configuration summary
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "OpenCV version: ${OpenCV_VERSION}")
-message(STATUS "Executable: ${PROJECT_NAME}")
+message(STATUS "Executable: ${PROJECT_NAME}, rtsp_stitcher")
