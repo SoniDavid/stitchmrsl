@@ -2,16 +2,26 @@
 #include <opencv2/opencv.hpp>
 #include <filesystem>
 #include <fstream>
+#include <csignal>
 #include <iostream>
 
 using namespace std;
 namespace fs = std::filesystem;
+
+volatile std::sig_atomic_t keepRunning = 1;
+
+void handle_sigint(int) {
+    keepRunning = 0;
+    cout << "\n[INFO] Stopping recording..." << endl;
+}
 
 int main(int argc, char** argv) {
     if (argc != 4) {
         cerr << "Usage: " << argv[0] << " <rtsp_left> <rtsp_center> <rtsp_right>" << endl;
         return -1;
     }
+
+    signal(SIGINT, handle_sigint);  // Register Ctrl+C handler
 
     fs::create_directory("output");
 
@@ -60,15 +70,15 @@ int main(int argc, char** argv) {
     bool pano_writer_ready = false;
 
     StitchingPipeline pipeline;
-    if (!pipeline.LoadIntrinsicsData("calibration/intrinsics.json") ||
-        !pipeline.LoadExtrinsicsData("calibration/extrinsics.json")) {
+    if (!pipeline.LoadIntrinsicsData("intrinsic.json") ||
+        !pipeline.LoadExtrinsicsData("extrinsic.json")) {
         cerr << "Calibration loading failed!" << endl;
         return -1;
     }
 
-    cout << "[INFO] Starting synchronized recording. Press ESC to stop..." << endl;
+    cout << "[INFO] Starting synchronized recording. Press Ctrl+C to stop..." << endl;
 
-    while (true) {
+    while (keepRunning) {
         vector<cv::Mat> frames(3);
         bool all_read = true;
 
@@ -80,14 +90,16 @@ int main(int argc, char** argv) {
         }
         if (!all_read) break;
 
-        for (int i = 0; i < 3; ++i) raw_writers[i].write(frames[i]);
+        for (int i = 0; i < 3; ++i)
+            raw_writers[i].write(frames[i]);
 
         vector<cv::Mat> rectified(3);
         rectified[0] = pipeline.RectifyImageFisheye(frames[0], "izquierda", pipeline.GetCameraIntrinsicsByName("izquierda"));
         rectified[1] = pipeline.RectifyImageFisheye(frames[1], "central", pipeline.GetCameraIntrinsicsByName("central"));
         rectified[2] = pipeline.RectifyImageFisheye(frames[2], "derecha", pipeline.GetCameraIntrinsicsByName("derecha"));
 
-        for (int i = 0; i < 3; ++i) rect_writers[i].write(rectified[i]);
+        for (int i = 0; i < 3; ++i)
+            rect_writers[i].write(rectified[i]);
 
         if (!pipeline.LoadTestImagesFromMats(rectified)) continue;
 
@@ -110,7 +122,7 @@ int main(int argc, char** argv) {
         bc_custom.at<double>(1, 1) = cos(bc_rad);
         bc_custom.at<double>(1, 2) = 0.0;
 
-        pipeline.SetBlendingMode(BlendingMode::FEATHERING);
+        pipeline.SetBlendingMode(BlendingMode::AVERAGE);
         cv::Mat pano = pipeline.CreatePanoramaWithCustomTransforms(ab_custom, bc_custom);
 
         if (!pano.empty()) {
@@ -120,8 +132,6 @@ int main(int argc, char** argv) {
             }
             pano_writer.write(pano);
         }
-
-        if (cv::waitKey(1) == 27) break;  // ESC to stop
     }
 
     for (int i = 0; i < 3; ++i) {
@@ -131,6 +141,6 @@ int main(int argc, char** argv) {
     }
     if (pano_writer_ready) pano_writer.release();
 
-    cout << "\n[INFO] Recording and stitching complete. Videos saved to output/." << endl;
+    cout << "[INFO] Recording and stitching complete. Videos saved to output/." << endl;
     return 0;
 }
