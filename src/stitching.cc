@@ -275,7 +275,7 @@ cv::Mat StitchingPipeline::CreatePanoramaWithCustomTransforms(const cv::Mat& cus
     cv::Mat& img_izq = rectified_images_[0];
     cv::Mat& img_central = rectified_images_[1];
     cv::Mat& img_der = rectified_images_[2];
-    std::cout << "1. Using rectified images." << std::endl;
+    // std::cout << "1. Using rectified images." << std::endl;
 
     // 2. Use custom transformations
     // Apply custom AB transform to the loaded transform
@@ -295,7 +295,7 @@ cv::Mat StitchingPipeline::CreatePanoramaWithCustomTransforms(const cv::Mat& cus
         loaded_bc_transform_.similarity.copyTo(base_bc_transform_3x3(cv::Rect(0, 0, 3, 2)));
     }
     cv::Mat transform_der_to_central_3x3 = custom_bc_transform * base_bc_transform_3x3;
-    std::cout << "2. Custom transformations applied." << std::endl;
+    // std::cout << "2. Custom transformations applied." << std::endl;
     
     // 3. Calculate the global canvas size
     std::vector<cv::Point2f> corners_izq = { {0,0}, {(float)img_izq.cols, 0}, {(float)img_izq.cols, (float)img_izq.rows}, {0, (float)img_izq.rows} };
@@ -313,7 +313,7 @@ cv::Mat StitchingPipeline::CreatePanoramaWithCustomTransforms(const cv::Mat& cus
     all_corners.insert(all_corners.end(), transformed_corners_der.begin(), transformed_corners_der.end());
 
     cv::Rect bounding_box = cv::boundingRect(all_corners);
-    std::cout << "3. Global canvas calculated: " << bounding_box.width << "x" << bounding_box.height << std::endl;
+    // std::cout << "3. Global canvas calculated: " << bounding_box.width << "x" << bounding_box.height << std::endl;
 
     // 4. Warp all images onto the final canvas
     cv::Mat offset_transform = cv::Mat::eye(3, 3, CV_64F);
@@ -333,7 +333,7 @@ cv::Mat StitchingPipeline::CreatePanoramaWithCustomTransforms(const cv::Mat& cus
     // Warp derecha
     cv::Mat warped_der;
     cv::warpPerspective(img_der, warped_der, offset_transform * transform_der_to_central_3x3, bounding_box.size());
-    std::cout << "4. All images warped to final canvas." << std::endl;
+    // std::cout << "4. All images warped to final canvas." << std::endl;
 
     // 5. Blend the images together using the selected blending mode
     cv::Mat panorama;
@@ -346,7 +346,7 @@ cv::Mat StitchingPipeline::CreatePanoramaWithCustomTransforms(const cv::Mat& cus
         panorama = warped_central.clone();
         BlendInPlace(panorama, warped_izq, BlendingMode::FEATHERING);
         BlendInPlace(panorama, warped_der, BlendingMode::FEATHERING);
-        std::cout << "5. Images blended using feathering." << std::endl;
+        // std::cout << "5. Images blended using feathering." << std::endl;
     }
 
     // 6. Crop final image to remove black borders
@@ -368,7 +368,7 @@ cv::Mat StitchingPipeline::CreatePanoramaWithCustomTransforms(const cv::Mat& cus
             }
         }
         cv::Rect crop_rect = cv::boundingRect(contours[max_area_idx]);
-        std::cout << "6. Cropping panorama to content." << std::endl;
+        // std::cout << "6. Cropping panorama to content." << std::endl;
         return panorama(crop_rect);
     }
     

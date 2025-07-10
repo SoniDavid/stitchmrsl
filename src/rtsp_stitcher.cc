@@ -98,11 +98,6 @@ int main(int argc, char** argv) {
         rectified[1] = pipeline.RectifyImageFisheye(buffers[1][f], "central", pipeline.GetCameraIntrinsicsByName("central"));
         rectified[2] = pipeline.RectifyImageFisheye(buffers[2][f], "derecha", pipeline.GetCameraIntrinsicsByName("derecha"));
 
-        if (!pano_writer_ready) {
-            pano_writer.open("output/panorama_result.avi", cv::VideoWriter::fourcc('X','V','I','D'), fps, rectified[1].size());
-            pano_writer_ready = true;
-        }
-
         // Save individual rectified frames
         for (int i = 0; i < 3; ++i) buffers[i][f] = rectified[i];
 
@@ -127,7 +122,28 @@ int main(int argc, char** argv) {
 
             pipeline.SetBlendingMode(BlendingMode::AVERAGE);
             cv::Mat pano = pipeline.CreatePanoramaWithCustomTransforms(ab_custom, bc_custom);
-            if (!pano.empty()) pano_writer.write(pano);
+
+            if (!pano.empty()) {
+                if (!pano_writer_ready) {
+                    std::string pano_path = "output/panorama_result.mp4";
+                    bool ok = pano_writer.open(pano_path, cv::VideoWriter::fourcc('a','v','c','1'), fps, pano.size());
+
+                    if (!ok) {
+                        cerr << "[WARNING] Could not open .mp4 with avc1 codec. Falling back to .avi with XVID.\n";
+                        pano_path = "output/panorama_result.avi";
+                        pano_writer.open(pano_path, cv::VideoWriter::fourcc('X','V','I','D'), fps, pano.size());
+                    }
+
+                    if (!pano_writer.isOpened()) {
+                        cerr << "[ERROR] Failed to open panorama output writer.\n";
+                        return -1;
+                    }
+
+                    pano_writer_ready = true;
+                }
+
+                pano_writer.write(pano);
+            }
         }
     }
 
