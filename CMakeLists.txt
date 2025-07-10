@@ -144,6 +144,8 @@ elseif(WIN32)
     target_compile_options(${PROJECT_NAME} PRIVATE ${GLFW3_CFLAGS_OTHER})
 endif()
 
+find_package(Threads REQUIRED)
+
 add_executable(rtsp_stitcher
     src/rtsp_stitcher.cc
     src/stitching.cc
@@ -157,6 +159,7 @@ target_include_directories(rtsp_stitcher PRIVATE
 
 target_link_libraries(rtsp_stitcher
     ${OpenCV_LIBS}
+    Threads::Threads
 )
 
 # Print configuration summary
