@@ -97,30 +97,31 @@ int main(int argc, char** argv) {
     bool pano_writer_ready = false;
     size_t frame_count = min({ buffers[0].size(), buffers[1].size(), buffers[2].size() });
 
-    for (size_t f = 0; f < frame_count; ++f) {
-        vector<cv::Mat> rectified(3);
-        rectified[0] = pipeline.RectifyImageFisheye(buffers[0][f], "izquierda", pipeline.GetCameraIntrinsicsByName("izquierda"));
-        rectified[1] = pipeline.RectifyImageFisheye(buffers[1][f], "central", pipeline.GetCameraIntrinsicsByName("central"));
-        rectified[2] = pipeline.RectifyImageFisheye(buffers[2][f], "derecha", pipeline.GetCameraIntrinsicsByName("derecha"));
+    // Create vectors to store rectified frames for saving later
+    vector<vector<cv::Mat>> rectified_buffers(3);
 
+    for (size_t f = 0; f < frame_count; ++f) {
+        // Instead of manually rectifying, let the pipeline handle it
+        // Just pass the raw frames directly to LoadTestImagesFromMats
+        vector<cv::Mat> raw_frames = { buffers[0][f], buffers[1][f], buffers[2][f] };
+        
         pipeline.SetBlendingMode(BlendingMode::AVERAGE);
 
-        if (!pipeline.LoadTestImagesFromMats(rectified)) {
-            cerr << "[ERROR] Failed to load rectified images into pipeline." << endl;
+        if (!pipeline.LoadTestImagesFromMats(raw_frames)) {
+            cerr << "[ERROR] Failed to load raw images into pipeline." << endl;
             continue;
         }
 
-        // Custom transformation matrices that work
-
+        // Use the same custom transformation matrices as in GUI
         // AB Transform (izquierda -> central)
         cv::Mat ab_custom = cv::Mat::eye(3, 3, CV_64F);
         float ab_rad = 0.800f * CV_PI / 180.0f;
         float ab_cos = cos(ab_rad);
         float ab_sin = sin(ab_rad);
-        float ab_scale_x = 0.9877;
-        float ab_scale_y = 1.0;
-        float ab_translation_x = -2.8;
-        float ab_translation_y = 0.0;
+        float ab_scale_x = 0.9877f;
+        float ab_scale_y = 1.0f;
+        float ab_translation_x = -2.8f;
+        float ab_translation_y = 0.0f;
 
         ab_custom.at<double>(0, 0) = ab_cos * ab_scale_x; 
         ab_custom.at<double>(0, 1) = -ab_sin * ab_scale_x;
@@ -134,10 +135,10 @@ int main(int argc, char** argv) {
         float bc_rad = 0.800f * CV_PI / 180.0f;
         float bc_cos = cos(bc_rad);
         float bc_sin = sin(bc_rad);
-        float bc_scale_x = 1.0;
-        float bc_scale_y = 1.0;
-        float bc_translation_x = 21.1;
-        float bc_translation_y = 0.0;
+        float bc_scale_x = 1.0f;
+        float bc_scale_y = 1.0f;
+        float bc_translation_x = 21.1f;
+        float bc_translation_y = 0.0f;
         
         bc_custom.at<double>(0, 0) = bc_cos * bc_scale_x;
         bc_custom.at<double>(0, 1) = -bc_sin * bc_scale_x;
@@ -164,12 +165,37 @@ int main(int argc, char** argv) {
         }
 
         pano_writer.write(pano);
-        cv::imwrite("debug/pano_" + to_string(f) + ".png", pano); // Optional debug image
+        
+        // Save debug frame every 30 frames to avoid too many files
+        if (f % 30 == 0) {
+            cv::imwrite("debug/pano_" + to_string(f) + ".png", pano);
+        }
+
+        // If you need rectified frames for saving, get them from the pipeline
+        // You'll need to add a method to your StitchingPipeline class to get rectified images
+        // or manually rectify here for saving purposes only
+        if (f == 0) { // Only rectify for the first frame to save one example
+            vector<cv::Mat> rectified(3);
+            rectified[0] = pipeline.RectifyImageFisheye(buffers[0][f], "izquierda", pipeline.GetCameraIntrinsicsByName("izquierda"));
+            rectified[1] = pipeline.RectifyImageFisheye(buffers[1][f], "central", pipeline.GetCameraIntrinsicsByName("central"));
+            rectified[2] = pipeline.RectifyImageFisheye(buffers[2][f], "derecha", pipeline.GetCameraIntrinsicsByName("derecha"));
+            
+            for (int i = 0; i < 3; ++i) {
+                rectified_buffers[i].push_back(rectified[i]);
+            }
+        }
     }
 
     // Save individual video streams
     for (int i = 0; i < 3; ++i) SaveVideo(buffers[i], raw_paths[i], fps);
-    for (int i = 0; i < 3; ++i) SaveVideo(buffers[i], rectified_paths[i], fps);
+    
+    // Save rectified videos (only if we have rectified frames)
+    for (int i = 0; i < 3; ++i) {
+        if (!rectified_buffers[i].empty()) {
+            SaveVideo(rectified_buffers[i], rectified_paths[i], fps);
+        }
+    }
+    
     if (pano_writer_ready) pano_writer.release();
 
     cout << "\n[INFO] Finished. All videos saved in /output.\n" << endl;

@@ -107,16 +107,16 @@ void ApplicationState::UpdatePanoramaWithAdjustments() {
         
         // AB Transform (izquierda -> central)
         cv::Mat ab_custom = cv::Mat::eye(3, 3, CV_64F);
-        float ab_rad = ab_rotation_deg * CV_PI / 180.0f;
+        float ab_rad = ab_rotation_deg * CV_PI / 180.0f; //ab_rotation_deg=0.80
         float ab_cos = cos(ab_rad);
         float ab_sin = sin(ab_rad);
         
-        ab_custom.at<double>(0, 0) = ab_cos * ab_scale_x;
+        ab_custom.at<double>(0, 0) = ab_cos * ab_scale_x; // ab_scale_x = 0.9877
         ab_custom.at<double>(0, 1) = -ab_sin * ab_scale_x;
-        ab_custom.at<double>(0, 2) = ab_translation_x;
-        ab_custom.at<double>(1, 0) = ab_sin * ab_scale_y;
+        ab_custom.at<double>(0, 2) = ab_translation_x; //-2.8
+        ab_custom.at<double>(1, 0) = ab_sin * ab_scale_y;  // ab_scale_y = 1.000
         ab_custom.at<double>(1, 1) = ab_cos * ab_scale_y;
-        ab_custom.at<double>(1, 2) = ab_translation_y;
+        ab_custom.at<double>(1, 2) = ab_translation_y; //0.0
         
         // BC Transform (derecha -> central)
         cv::Mat bc_custom = cv::Mat::eye(3, 3, CV_64F);
@@ -126,10 +126,10 @@ void ApplicationState::UpdatePanoramaWithAdjustments() {
         
         bc_custom.at<double>(0, 0) = bc_cos * bc_scale_x;
         bc_custom.at<double>(0, 1) = -bc_sin * bc_scale_x;
-        bc_custom.at<double>(0, 2) = bc_translation_x;
+        bc_custom.at<double>(0, 2) = bc_translation_x; //21.1
         bc_custom.at<double>(1, 0) = bc_sin * bc_scale_y;
         bc_custom.at<double>(1, 1) = bc_cos * bc_scale_y;
-        bc_custom.at<double>(1, 2) = bc_translation_y;
+        bc_custom.at<double>(1, 2) = bc_translation_y; // 0.00
         
         stitched_mat = pipeline->CreatePanoramaWithCustomTransforms(ab_custom, bc_custom);
     } else {
