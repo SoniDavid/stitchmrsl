@@ -110,22 +110,41 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        // Custom transformation matrices
+        // Custom transformation matrices that work
+
+        // AB Transform (izquierda -> central)
         cv::Mat ab_custom = cv::Mat::eye(3, 3, CV_64F);
         float ab_rad = 0.800f * CV_PI / 180.0f;
-        ab_custom.at<double>(0, 0) = cos(ab_rad) * 0.9877;
-        ab_custom.at<double>(0, 1) = -sin(ab_rad) * 0.9877;
-        ab_custom.at<double>(0, 2) = -2.8;
-        ab_custom.at<double>(1, 0) = sin(ab_rad);
-        ab_custom.at<double>(1, 1) = cos(ab_rad);
+        float ab_cos = cos(ab_rad);
+        float ab_sin = sin(ab_rad);
+        float ab_scale_x = 0.9877;
+        float ab_scale_y = 1.0;
+        float ab_translation_x = -2.8;
+        float ab_translation_y = 0.0;
 
+        ab_custom.at<double>(0, 0) = ab_cos * ab_scale_x; 
+        ab_custom.at<double>(0, 1) = -ab_sin * ab_scale_x;
+        ab_custom.at<double>(0, 2) = ab_translation_x; 
+        ab_custom.at<double>(1, 0) = ab_sin * ab_scale_y; 
+        ab_custom.at<double>(1, 1) = ab_cos * ab_scale_y;
+        ab_custom.at<double>(1, 2) = ab_translation_y; 
+        
+        // BC Transform (derecha -> central)
         cv::Mat bc_custom = cv::Mat::eye(3, 3, CV_64F);
-        float bc_rad = 0.0f;
-        bc_custom.at<double>(0, 0) = cos(bc_rad);
-        bc_custom.at<double>(0, 1) = -sin(bc_rad);
-        bc_custom.at<double>(0, 2) = 21.1;
-        bc_custom.at<double>(1, 0) = sin(bc_rad);
-        bc_custom.at<double>(1, 1) = cos(bc_rad);
+        float bc_rad = 0.800f * CV_PI / 180.0f;
+        float bc_cos = cos(bc_rad);
+        float bc_sin = sin(bc_rad);
+        float bc_scale_x = 1.0;
+        float bc_scale_y = 1.0;
+        float bc_translation_x = 21.1;
+        float bc_translation_y = 0.0;
+        
+        bc_custom.at<double>(0, 0) = bc_cos * bc_scale_x;
+        bc_custom.at<double>(0, 1) = -bc_sin * bc_scale_x;
+        bc_custom.at<double>(0, 2) = bc_translation_x; 
+        bc_custom.at<double>(1, 0) = bc_sin * bc_scale_y;
+        bc_custom.at<double>(1, 1) = bc_cos * bc_scale_y;
+        bc_custom.at<double>(1, 2) = bc_translation_y; 
 
         // Generate panorama
         cv::Mat pano = pipeline.CreatePanoramaWithCustomTransforms(ab_custom, bc_custom);
