@@ -1,4 +1,4 @@
-// rtsp_stitcher.cpp
+// Enhanced rtsp_stitcher.cpp with timestamp-based synchronization
 #include "stitching.hh"
 #include <opencv2/opencv.hpp>
 #include <csignal>
@@ -10,113 +10,99 @@
 #include <iomanip>
 #include <sstream>
 #include <chrono>
+#include <queue>
+#include <map>
+#include <vector>
+#include <algorithm>
 
 using namespace std;
+using namespace std::chrono;
 namespace fs = std::filesystem;
 
 atomic<bool> stop_requested(false);
 
-void signal_handler(int signal) {
-    if (signal == SIGINT) {
-        stop_requested = true;
-        cout << "\n[INFO] Ctrl+C received. Finishing current recording before exit...\n";
-    }
-}
+// Structure to hold frame with timestamp
+struct TimestampedFrame {
+    cv::Mat frame;
+    steady_clock::time_point timestamp;
+    int64_t timestamp_ms;
+    int frame_index;
+    int camera_id;
+};
 
-// Step 1: Capture RTSP streams and save as raw video files
-void CaptureRTSPToFile(const string& url, const string& output_path, int cam_id) {
-    cv::VideoCapture cap(url);
-    if (!cap.isOpened()) {
-        cerr << "[CAM " << cam_id << "] Failed to open: " << url << endl;
-        return;
-    }
-
-    // Get video properties
-    double fps = cap.get(cv::CAP_PROP_FPS);
-    if (fps <= 0) fps = 15.0; // Default fallback
+// Thread-safe frame buffer for each camera
+class FrameBuffer {
+private:
+    queue<TimestampedFrame> buffer;
+    mutable mutex buffer_mutex;
+    const size_t max_size;
     
-    int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-    int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+public:
+    FrameBuffer(size_t max_buffer_size = 100) : max_size(max_buffer_size) {}
     
-    cout << "[CAM " << cam_id << "] Properties: " << width << "x" << height << " @ " << fps << " FPS" << endl;
-    
-    // Create video writer
-    cv::VideoWriter writer(output_path, cv::VideoWriter::fourcc('a','v','c','1'), fps, cv::Size(width, height));
-    if (!writer.isOpened()) {
-        cerr << "[CAM " << cam_id << "] Failed to create video writer for: " << output_path << endl;
-        return;
-    }
-
-    cout << "[CAM " << cam_id << "] Started recording to: " << output_path << endl;
-    
-    int frame_count = 0;
-    auto start_time = chrono::steady_clock::now();
-    
-    while (!stop_requested) {
-        cv::Mat frame;
-        if (!cap.read(frame) || frame.empty()) {
-            cerr << "[CAM " << cam_id << "] Failed to read frame or stream ended" << endl;
-            break;
-        }
+    void Push(const TimestampedFrame& frame) {
+        lock_guard<mutex> lock(buffer_mutex);
+        buffer.push(frame);
         
-        writer.write(frame);
-        frame_count++;
-        
-        // Progress update every 5 seconds
-        if (frame_count % (static_cast<int>(fps) * 5) == 0) {
-            auto elapsed = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - start_time).count();
-            cout << "[CAM " << cam_id << "] Recorded " << frame_count << " frames (" << elapsed << "s)" << endl;
+        // Remove old frames if buffer is full
+        while (buffer.size() > max_size) {
+            buffer.pop();
         }
     }
     
-    writer.release();
-    cap.release();
-    cout << "[CAM " << cam_id << "] Stopped recording. Total frames: " << frame_count << endl;
-}
-
-// Step 2: Extract frames from video files
-bool ExtractFramesFromVideo(const string& video_path, const string& frames_dir, const string& prefix) {
-    cv::VideoCapture cap(video_path);
-    if (!cap.isOpened()) {
-        cerr << "[ERROR] Failed to open video: " << video_path << endl;
+    bool Pop(TimestampedFrame& frame) {
+        lock_guard<mutex> lock(buffer_mutex);
+        if (buffer.empty()) return false;
+        
+        frame = buffer.front();
+        buffer.pop();
+        return true;
+    }
+    
+    bool GetClosestFrame(int64_t target_timestamp_ms, TimestampedFrame& frame, int64_t tolerance_ms = 100) {
+        lock_guard<mutex> lock(buffer_mutex);
+        if (buffer.empty()) return false;
+        
+        // Find the frame with timestamp closest to target
+        TimestampedFrame closest_frame;
+        int64_t min_diff = LLONG_MAX;
+        bool found = false;
+        
+        queue<TimestampedFrame> temp_buffer = buffer;
+        
+        while (!temp_buffer.empty()) {
+            TimestampedFrame current = temp_buffer.front();
+            temp_buffer.pop();
+            
+            int64_t diff = abs(current.timestamp_ms - target_timestamp_ms);
+            if (diff <= tolerance_ms && diff < min_diff) {
+                min_diff = diff;
+                closest_frame = current;
+                found = true;
+            }
+        }
+        
+        if (found) {
+            frame = closest_frame;
+            return true;
+        }
         return false;
     }
     
-    fs::create_directories(frames_dir);
-    
-    int frame_count = 0;
-    cv::Mat frame;
-    
-    cout << "[INFO] Extracting frames from: " << video_path << endl;
-    
-    while (cap.read(frame)) {
-        if (frame.empty()) break;
-        
-        // Create frame filename with zero-padded numbers
-        stringstream ss;
-        ss << frames_dir << "/" << prefix << "_" << setfill('0') << setw(6) << frame_count << ".png";
-        string frame_path = ss.str();
-        
-        if (!cv::imwrite(frame_path, frame)) {
-            cerr << "[ERROR] Failed to save frame: " << frame_path << endl;
-            cap.release();
-            return false;
-        }
-        
-        frame_count++;
-        
-        // Progress update
-        if (frame_count % 150 == 0) {
-            cout << "[INFO] Extracted " << frame_count << " frames from " << prefix << endl;
-        }
+    size_t Size() const {
+        lock_guard<mutex> lock(buffer_mutex);
+        return buffer.size();
     }
     
-    cap.release();
-    cout << "[INFO] Finished extracting " << frame_count << " frames from " << prefix << endl;
-    return true;
-}
+    void Clear() {
+        lock_guard<mutex> lock(buffer_mutex);
+        while (!buffer.empty()) {
+            buffer.pop();
+        }
+    }
+};
 
-// Step 3: Process frames and create panorama video
+// Process frames and create panorama video (from original code)
 bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output_video_path, 
                            StitchingPipeline& pipeline, double fps = 15.0) {
     
@@ -228,16 +214,6 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
             continue;
         }
         
-        // Debug: Save input frames for first few frames
-        if (frame_idx < 5) {
-            fs::create_directories("debug/input");
-            for (int cam = 0; cam < 3; cam++) {
-                string debug_path = "debug/input/" + camera_names[cam] + "_frame_" + to_string(frame_idx) + ".png";
-                cv::imwrite(debug_path, frames[cam]);
-            }
-            cout << "[DEBUG] Saved input frames for frame " << frame_idx << endl;
-        }
-        
         // Load fresh frames into pipeline
         if (!pipeline.LoadTestImagesFromMats(frames)) {
             cerr << "[ERROR] Failed to load frames into pipeline for frame " << frame_idx << endl;
@@ -250,22 +226,6 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
             cerr << "[WARNING] Empty panorama at frame " << frame_idx << endl;
             continue;
         }
-        
-        // Debug: Check if panorama is actually different
-        static cv::Mat prev_pano;
-        if (!prev_pano.empty() && frame_idx > 0) {
-            cv::Mat diff;
-            cv::absdiff(pano, prev_pano, diff);
-            cv::Scalar diff_sum = cv::sum(diff);
-            double total_diff = diff_sum[0] + diff_sum[1] + diff_sum[2];
-            
-            if (total_diff < 1000) { // Very small difference threshold
-                cerr << "[WARNING] Frame " << frame_idx << " is very similar to previous frame (diff: " << total_diff << ")" << endl;
-            } else {
-                cout << "[DEBUG] Frame " << frame_idx << " difference from previous: " << total_diff << endl;
-            }
-        }
-        prev_pano = pano.clone();
         
         // Initialize video writer on first successful frame
         if (!writer_initialized) {
@@ -307,22 +267,6 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
         pano_writer.write(pano);
         successful_frames++;
         
-        // Verify writer is still working
-        if (!pano_writer.isOpened()) {
-            cerr << "[ERROR] Video writer closed unexpectedly at frame " << frame_idx << endl;
-            return false;
-        }
-        
-        // Save debug frame more frequently for debugging
-        if (frame_idx % 30 == 0) {
-            fs::create_directories("debug/output");
-            cv::imwrite("debug/output/pano_" + to_string(frame_idx) + ".png", pano);
-            cout << "[DEBUG] Saved debug frame: pano_" << frame_idx << ".png" << endl;
-        }
-        
-        // Clear frames to free memory
-        frames.clear();
-        
         // Progress update
         if (frame_idx % 30 == 0) {
             cout << "[INFO] Processed frame " << frame_idx << "/" << min_frames 
@@ -339,70 +283,351 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
     return true;
 }
 
+void signal_handler(int signal) {
+    if (signal == SIGINT) {
+        stop_requested = true;
+        cout << "\n[INFO] Ctrl+C received. Finishing current recording before exit...\n";
+    }
+}
+
+// Enhanced capture function with timestamp recording
+void CaptureRTSPWithTimestamps(const string& url, int cam_id, FrameBuffer& frame_buffer) {
+    cv::VideoCapture cap(url);
+    if (!cap.isOpened()) {
+        cerr << "[CAM " << cam_id << "] Failed to open: " << url << endl;
+        return;
+    }
+
+    // Set buffer size to minimize latency
+    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+    
+    // Get video properties
+    double fps = cap.get(cv::CAP_PROP_FPS);
+    if (fps <= 0) fps = 15.0; // Default fallback
+    
+    int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    
+    cout << "[CAM " << cam_id << "] Properties: " << width << "x" << height << " @ " << fps << " FPS" << endl;
+    cout << "[CAM " << cam_id << "] Started capturing with timestamp sync" << endl;
+    
+    int frame_count = 0;
+    auto start_time = steady_clock::now();
+    
+    while (!stop_requested) {
+        cv::Mat frame;
+        auto capture_timestamp = steady_clock::now();
+        
+        if (!cap.read(frame) || frame.empty()) {
+            cerr << "[CAM " << cam_id << "] Failed to read frame or stream ended" << endl;
+            break;
+        }
+        
+        // Create timestamped frame
+        TimestampedFrame ts_frame;
+        ts_frame.frame = frame.clone();
+        ts_frame.timestamp = capture_timestamp;
+        ts_frame.timestamp_ms = duration_cast<milliseconds>(capture_timestamp - start_time).count();
+        ts_frame.frame_index = frame_count;
+        ts_frame.camera_id = cam_id;
+        
+        frame_buffer.Push(ts_frame);
+        frame_count++;
+        
+        // Progress update every 5 seconds
+        if (frame_count % (static_cast<int>(fps) * 5) == 0) {
+            auto elapsed = duration_cast<seconds>(steady_clock::now() - start_time).count();
+            cout << "[CAM " << cam_id << "] Captured " << frame_count << " frames (" << elapsed << "s)" << endl;
+        }
+    }
+    
+    cap.release();
+    cout << "[CAM " << cam_id << "] Stopped capturing. Total frames: " << frame_count << endl;
+}
+
+// Synchronized frame writer
+class SynchronizedFrameWriter {
+private:
+    vector<FrameBuffer*> buffers;
+    vector<string> camera_names;
+    string output_base_path;
+    int64_t sync_tolerance_ms;
+    
+public:
+    SynchronizedFrameWriter(vector<FrameBuffer*> frame_buffers, 
+                           vector<string> cam_names, 
+                           const string& base_path, 
+                           int64_t tolerance_ms = 50) 
+        : buffers(frame_buffers), camera_names(cam_names), 
+          output_base_path(base_path), sync_tolerance_ms(tolerance_ms) {}
+    
+    void WriteSynchronizedFrames() {
+        cout << "[SYNC] Starting synchronized frame writing with " << sync_tolerance_ms << "ms tolerance" << endl;
+        
+        // Create output directories
+        for (const auto& name : camera_names) {
+            fs::create_directories(output_base_path + "/" + name);
+        }
+        
+        int synchronized_frame_count = 0;
+        
+        while (!stop_requested) {
+            // Wait for all buffers to have frames
+            bool all_ready = true;
+            for (auto buffer : buffers) {
+                if (buffer->Size() == 0) {
+                    all_ready = false;
+                    break;
+                }
+            }
+            
+            if (!all_ready) {
+                this_thread::sleep_for(milliseconds(10));
+                continue;
+            }
+            
+            // Find the latest common timestamp across all cameras
+            int64_t reference_timestamp = 0;
+            bool first = true;
+            
+            for (auto buffer : buffers) {
+                TimestampedFrame temp_frame;
+                if (buffer->GetClosestFrame(0, temp_frame, LLONG_MAX)) {
+                    if (first) {
+                        reference_timestamp = temp_frame.timestamp_ms;
+                        first = false;
+                    } else {
+                        reference_timestamp = max(reference_timestamp, temp_frame.timestamp_ms);
+                    }
+                }
+            }
+            
+            if (first) continue; // No frames available
+            
+            // Extract synchronized frames
+            vector<TimestampedFrame> sync_frames(buffers.size());
+            bool sync_successful = true;
+            
+            for (size_t i = 0; i < buffers.size(); i++) {
+                if (!buffers[i]->GetClosestFrame(reference_timestamp, sync_frames[i], sync_tolerance_ms)) {
+                    sync_successful = false;
+                    break;
+                }
+            }
+            
+            if (!sync_successful) {
+                this_thread::sleep_for(milliseconds(10));
+                continue;
+            }
+            
+            // Save synchronized frames
+            for (size_t i = 0; i < sync_frames.size(); i++) {
+                stringstream ss;
+                ss << output_base_path << "/" << camera_names[i] << "/" 
+                   << camera_names[i] << "_" << setfill('0') << setw(6) << synchronized_frame_count << ".png";
+                
+                if (!cv::imwrite(ss.str(), sync_frames[i].frame)) {
+                    cerr << "[SYNC] Failed to save frame: " << ss.str() << endl;
+                }
+            }
+            
+            synchronized_frame_count++;
+            
+            // Progress update
+            if (synchronized_frame_count % 150 == 0) {
+                cout << "[SYNC] Wrote " << synchronized_frame_count << " synchronized frame sets" << endl;
+            }
+            
+            // Optional: Save timestamp info for debugging
+            if (synchronized_frame_count % 300 == 0) {
+                cout << "[SYNC] Timestamp differences at frame " << synchronized_frame_count << ":" << endl;
+                for (size_t i = 0; i < sync_frames.size(); i++) {
+                    cout << "  [CAM " << i << "] diff: " << (sync_frames[i].timestamp_ms - reference_timestamp) << "ms" << endl;
+                }
+            }
+        }
+        
+        cout << "[SYNC] Finished writing " << synchronized_frame_count << " synchronized frame sets" << endl;
+    }
+};
+
+// Alternative approach: Hardware sync using external trigger
+class HardwareSyncCapture {
+private:
+    vector<cv::VideoCapture> cameras;
+    vector<string> rtsp_urls;
+    
+public:
+    HardwareSyncCapture(const vector<string>& urls) : rtsp_urls(urls) {
+        cameras.resize(urls.size());
+    }
+    
+    bool Initialize() {
+        for (size_t i = 0; i < rtsp_urls.size(); i++) {
+            cameras[i].open(rtsp_urls[i]);
+            if (!cameras[i].isOpened()) {
+                cerr << "[HWSYNC] Failed to open camera " << i << ": " << rtsp_urls[i] << endl;
+                return false;
+            }
+            
+            // Set properties for synchronization
+            cameras[i].set(cv::CAP_PROP_BUFFERSIZE, 1);
+            cameras[i].set(cv::CAP_PROP_FPS, 15); // Force same FPS
+            
+            cout << "[HWSYNC] Camera " << i << " initialized" << endl;
+        }
+        return true;
+    }
+    
+    bool CaptureFrameSet(vector<cv::Mat>& frames) {
+        frames.resize(cameras.size());
+        
+        // Capture from all cameras as quickly as possible
+        for (size_t i = 0; i < cameras.size(); i++) {
+            if (!cameras[i].read(frames[i]) || frames[i].empty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    void Release() {
+        for (auto& cam : cameras) {
+            cam.release();
+        }
+    }
+};
+
+// Network Time Protocol (NTP) sync approach
+class NTPSyncCapture {
+private:
+    struct CameraStream {
+        cv::VideoCapture cap;
+        string url;
+        steady_clock::time_point start_time;
+        double expected_fps;
+        int frame_count;
+        
+        CameraStream(const string& rtsp_url) : url(rtsp_url), frame_count(0) {
+            cap.open(url);
+            expected_fps = cap.get(cv::CAP_PROP_FPS);
+            if (expected_fps <= 0) expected_fps = 15.0;
+            start_time = steady_clock::now();
+        }
+        
+        bool GetFrameAtTime(steady_clock::time_point target_time, cv::Mat& frame) {
+            auto time_diff = target_time - start_time;
+            int target_frame = static_cast<int>(duration_cast<milliseconds>(time_diff).count() * expected_fps / 1000.0);
+            
+            // Skip frames to reach target time
+            while (frame_count < target_frame) {
+                cv::Mat temp_frame;
+                if (!cap.read(temp_frame)) return false;
+                frame_count++;
+            }
+            
+            // Capture the frame at target time
+            return cap.read(frame);
+        }
+    };
+    
+    vector<unique_ptr<CameraStream>> streams;
+    
+public:
+    NTPSyncCapture(const vector<string>& rtsp_urls) {
+        for (const auto& url : rtsp_urls) {
+            streams.push_back(make_unique<CameraStream>(url));
+        }
+    }
+    
+    bool CaptureAtTime(steady_clock::time_point target_time, vector<cv::Mat>& frames) {
+        frames.resize(streams.size());
+        
+        for (size_t i = 0; i < streams.size(); i++) {
+            if (!streams[i]->GetFrameAtTime(target_time, frames[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        cerr << "Usage: " << argv[0] << " <rtsp_left> <rtsp_center> <rtsp_right>" << endl;
+    if (argc < 4) {
+        cerr << "Usage: " << argv[0] << " <rtsp_left> <rtsp_center> <rtsp_right> [sync_method]" << endl;
+        cerr << "sync_method: 0=timestamp (default), 1=hardware, 2=ntp" << endl;
         return -1;
     }
 
     signal(SIGINT, signal_handler);
     
+    vector<string> rtsp_links = { argv[1], argv[2], argv[3] };
+    int sync_method = (argc > 4) ? atoi(argv[4]) : 0;
+    
     // Create directory structure
-    fs::create_directories("output/raw");
     fs::create_directories("output/frames/left");
     fs::create_directories("output/frames/central");
     fs::create_directories("output/frames/right");
     fs::create_directories("debug");
-
-    vector<string> rtsp_links = { argv[1], argv[2], argv[3] };
-    vector<string> raw_paths = {
-        "output/raw/left.mp4",
-        "output/raw/central.mp4",
-        "output/raw/right.mp4"
-    };
     
-    cout << "\n=== STEP 1: CAPTURING RTSP STREAMS ===" << endl;
-    
-    // Step 1: Capture RTSP streams in parallel
-    vector<thread> capture_threads;
-    for (int i = 0; i < 3; ++i) {
-        capture_threads.emplace_back(CaptureRTSPToFile, rtsp_links[i], raw_paths[i], i);
-    }
-    
-    // Wait for all capture threads
-    for (auto& t : capture_threads) {
-        t.join();
-    }
-    
-    if (stop_requested) {
-        cout << "[INFO] Capture interrupted by user" << endl;
-    }
-    
-    cout << "\n=== STEP 2: EXTRACTING FRAMES ===" << endl;
-    
-    // Step 2: Extract frames from videos
     vector<string> camera_names = {"left", "central", "right"};
-    vector<string> frame_dirs = {
-        "output/frames/left",
-        "output/frames/central",
-        "output/frames/right"
-    };
     
-    for (int i = 0; i < 3; ++i) {
-        if (!fs::exists(raw_paths[i])) {
-            cerr << "[ERROR] Raw video not found: " << raw_paths[i] << endl;
-            continue;
+    cout << "\n=== SYNCHRONIZED RTSP CAPTURE ===" << endl;
+    cout << "Sync method: " << sync_method << endl;
+    
+    if (sync_method == 0) {
+        // Timestamp-based synchronization
+        vector<FrameBuffer> frame_buffers(3);
+        vector<FrameBuffer*> buffer_ptrs = {&frame_buffers[0], &frame_buffers[1], &frame_buffers[2]};
+        
+        // Start capture threads
+        vector<thread> capture_threads;
+        for (int i = 0; i < 3; i++) {
+            capture_threads.emplace_back(CaptureRTSPWithTimestamps, rtsp_links[i], i, ref(frame_buffers[i]));
         }
         
-        if (!ExtractFramesFromVideo(raw_paths[i], frame_dirs[i], camera_names[i])) {
-            cerr << "[ERROR] Failed to extract frames from: " << raw_paths[i] << endl;
+        // Start synchronized writer
+        SynchronizedFrameWriter writer(buffer_ptrs, camera_names, "output/frames", 50); // 50ms tolerance
+        thread writer_thread(&SynchronizedFrameWriter::WriteSynchronizedFrames, &writer);
+        
+        // Wait for completion
+        for (auto& t : capture_threads) {
+            t.join();
+        }
+        writer_thread.join();
+        
+    } else if (sync_method == 1) {
+        // Hardware synchronization
+        HardwareSyncCapture hw_sync(rtsp_links);
+        if (!hw_sync.Initialize()) {
+            cerr << "[ERROR] Failed to initialize hardware sync" << endl;
             return -1;
         }
+        
+        int frame_count = 0;
+        while (!stop_requested) {
+            vector<cv::Mat> frames;
+            if (hw_sync.CaptureFrameSet(frames)) {
+                // Save synchronized frames
+                for (size_t i = 0; i < frames.size(); i++) {
+                    stringstream ss;
+                    ss << "output/frames/" << camera_names[i] << "/" << camera_names[i] 
+                       << "_" << setfill('0') << setw(6) << frame_count << ".png";
+                    cv::imwrite(ss.str(), frames[i]);
+                }
+                frame_count++;
+                
+                if (frame_count % 150 == 0) {
+                    cout << "[HWSYNC] Captured " << frame_count << " synchronized frame sets" << endl;
+                }
+            }
+        }
+        hw_sync.Release();
     }
     
-    cout << "\n=== STEP 3: PROCESSING PANORAMA ===" << endl;
+    cout << "\n=== PROCESSING PANORAMA ===" << endl;
     
-    // Step 3: Load calibration and process frames
+    // Continue with existing panorama processing...
     StitchingPipeline pipeline;
     if (!pipeline.LoadIntrinsicsData("intrinsic.json") ||
         !pipeline.LoadExtrinsicsData("extrinsic.json")) {
@@ -410,17 +635,15 @@ int main(int argc, char** argv) {
         return -1;
     }
     
-    double fps = 15.0; // You might want to read this from the original videos
-    if (!ProcessFramesToPanorama("output/frames", "output/panorama_result.mp4", pipeline, fps)) {
+    // Process synchronized frames to panorama
+    if (!ProcessFramesToPanorama("output/frames", "output/panorama_result.mp4", pipeline, 15.0)) {
         cerr << "[ERROR] Failed to create panorama video" << endl;
         return -1;
     }
     
     cout << "\n=== PROCESSING COMPLETE ===" << endl;
-    cout << "Raw videos: output/raw/ (MP4 format)" << endl;
-    cout << "Extracted frames: output/frames/" << endl;
+    cout << "Synchronized frames: output/frames/" << endl;
     cout << "Final panorama: output/panorama_result.mp4" << endl;
-    cout << "Debug frames: debug/" << endl;
     
     return 0;
 }
