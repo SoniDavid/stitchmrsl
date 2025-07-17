@@ -265,17 +265,18 @@ cv::Mat StitchingPipeline::CreatePanoramaWithCustomTransforms(const cv::Mat& cus
     
     std::cout << "=== STARTING PANORAMA CREATION WITH CUSTOM TRANSFORMS ===" << std::endl;
 
-    // 1. Rectify all three images (reuse existing rectified images if available)
-    if (rectified_images_.size() != 3) {
-        rectified_images_.clear();
-        for (size_t i = 0; i < test_images_.size(); ++i) {
-            rectified_images_.push_back(RectifyImageFisheye(test_images_[i], cameras_[i].name, cameras_[i].intrinsics));
-        }
+    // 1. Always rectify images fresh for each frame (remove the caching logic)
+    rectified_images_.clear();
+    for (size_t i = 0; i < test_images_.size(); ++i) {
+        cv::Mat rectified = RectifyImageFisheye(test_images_[i], cameras_[i].name, cameras_[i].intrinsics);
+        rectified_images_.push_back(rectified);
+        std::cout << "[DEBUG] Rectified image " << i << " (" << cameras_[i].name << ")" << std::endl;
     }
+    
     cv::Mat& img_izq = rectified_images_[0];
     cv::Mat& img_central = rectified_images_[1];
     cv::Mat& img_der = rectified_images_[2];
-    // std::cout << "1. Using rectified images." << std::endl;
+    std::cout << "1. Images rectified fresh for this frame." << std::endl;
 
     // 2. Use custom transformations
     // Apply custom AB transform to the loaded transform
@@ -504,4 +505,19 @@ const CameraIntrinsics& StitchingPipeline::GetCameraIntrinsicsByName(const std::
         }
     }
     throw std::runtime_error("Camera intrinsics not found for: " + name);
+}
+
+void StitchingPipeline::ClearCache() {
+    // Clear cached rectified images
+    rectified_images_.clear();
+    
+    // Clear test images to ensure fresh data
+    test_images_.clear();
+    
+    std::cout << "[DEBUG] Pipeline cache cleared" << std::endl;
+}
+
+void StitchingPipeline::ForceRectificationRecalculation() {
+    rectified_images_.clear();
+    std::cout << "[DEBUG] Forcing rectification recalculation" << std::endl;
 }

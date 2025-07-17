@@ -58,13 +58,15 @@ public:
 
     const CameraIntrinsics& GetCameraIntrinsicsByName(const std::string& name) const;
     cv::Mat RectifyImageFisheye(const cv::Mat& image, const std::string& name, const CameraIntrinsics& intrinsics);
-
+    void ClearCache();
+    void ForceRectificationRecalculation();
 
 
 private:
     // --- HELPER METHODS ---
     void PrecomputeRectificationMaps();
     void BlendInPlace(cv::Mat& base, const cv::Mat& overlay, BlendingMode mode);
+
 
 
     // --- MEMBER VARIABLES ---

@@ -184,6 +184,11 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
     bool writer_initialized = false;
     
     for (int frame_idx = 0; frame_idx < min_frames; frame_idx++) {
+        cout << "[INFO] Processing frame " << frame_idx << "/" << min_frames << endl;
+        
+        // CRITICAL: Clear pipeline cache before each frame
+        pipeline.ClearCache();
+        
         // Load synchronized frames
         vector<cv::Mat> frames(3);
         vector<string> frame_paths(3);
@@ -231,17 +236,13 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
             cout << "[DEBUG] Saved input frames for frame " << frame_idx << endl;
         }
         
-        // Create a fresh pipeline instance for each frame or clear existing state
-        // This ensures we're not reusing cached results
-        pipeline.SetBlendingMode(BlendingMode::AVERAGE);
-        
-        // Process through pipeline
+        // Load fresh frames into pipeline
         if (!pipeline.LoadTestImagesFromMats(frames)) {
             cerr << "[ERROR] Failed to load frames into pipeline for frame " << frame_idx << endl;
             continue;
         }
         
-        // Generate panorama
+        // Generate panorama with fresh data
         cv::Mat pano = pipeline.CreatePanoramaWithCustomTransforms(ab_custom, bc_custom);
         if (pano.empty()) {
             cerr << "[WARNING] Empty panorama at frame " << frame_idx << endl;
@@ -266,7 +267,7 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
         
         // Initialize video writer on first successful frame
         if (!writer_initialized) {
-            pano_writer.open(output_video_path, cv::VideoWriter::fourcc('a','v','c','1'), fps, pano.size());
+            pano_writer.open(output_video_path, cv::VideoWriter::fourcc('M','J','P','G'), fps, pano.size());
             if (!pano_writer.isOpened()) {
                 cerr << "[ERROR] Could not open output video file: " << output_video_path << endl;
                 return false;
@@ -275,24 +276,22 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
             cout << "[INFO] Initialized video writer: " << pano.size() << " @ " << fps << " FPS" << endl;
         }
         
+        // Write frame to video
         pano_writer.write(pano);
+        
+        // Save debug frame more frequently for debugging
+        if (frame_idx % 30 == 0) {
+            fs::create_directories("debug/output");
+            cv::imwrite("debug/output/pano_" + to_string(frame_idx) + ".png", pano);
+        }
+        
+        // Clear frames to free memory
+        frames.clear();
         
         // Progress update
         if (frame_idx % 30 == 0) {
             cout << "[INFO] Processed frame " << frame_idx << "/" << min_frames << endl;
         }
-        
-        // Save debug frame more frequently for debugging
-        if (frame_idx % 30 == 0) {
-            fs::create_directories("debug");
-            cv::imwrite("debug/pano_" + to_string(frame_idx) + ".png", pano);
-        }
-        
-        // Clear frames to free memory
-        for (auto& frame : frames) {
-            frame.release();
-        }
-        pano.release();
     }
     
     if (writer_initialized) {
