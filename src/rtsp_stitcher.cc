@@ -182,6 +182,8 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
     
     cv::VideoWriter pano_writer;
     bool writer_initialized = false;
+    cv::Size video_size;
+    int successful_frames = 0;
     
     for (int frame_idx = 0; frame_idx < min_frames; frame_idx++) {
         cout << "[INFO] Processing frame " << frame_idx << "/" << min_frames << endl;
@@ -267,22 +269,55 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
         
         // Initialize video writer on first successful frame
         if (!writer_initialized) {
-            pano_writer.open(output_video_path, cv::VideoWriter::fourcc('M','J','P','G'), fps, pano.size());
-            if (!pano_writer.isOpened()) {
-                cerr << "[ERROR] Could not open output video file: " << output_video_path << endl;
+            video_size = pano.size();
+            
+            // Try multiple codecs in order of preference
+            vector<pair<int, string>> codecs = {
+                {cv::VideoWriter::fourcc('m', 'p', '4', 'v'), "MP4V"},
+                {cv::VideoWriter::fourcc('X', 'V', 'I', 'D'), "XVID"},
+                {cv::VideoWriter::fourcc('H', '2', '6', '4'), "H264"},
+                {cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), "MJPG"}
+            };
+            
+            for (const auto& codec : codecs) {
+                pano_writer.open(output_video_path, codec.first, fps, video_size);
+                if (pano_writer.isOpened()) {
+                    cout << "[INFO] Successfully initialized video writer with codec: " << codec.second << endl;
+                    cout << "[INFO] Video size: " << video_size << " @ " << fps << " FPS" << endl;
+                    writer_initialized = true;
+                    break;
+                }
+                cout << "[WARNING] Failed to initialize with codec: " << codec.second << endl;
+            }
+            
+            if (!writer_initialized) {
+                cerr << "[ERROR] Could not initialize video writer with any codec" << endl;
                 return false;
             }
-            writer_initialized = true;
-            cout << "[INFO] Initialized video writer: " << pano.size() << " @ " << fps << " FPS" << endl;
+        }
+        
+        // Ensure panorama size matches video size
+        if (pano.size() != video_size) {
+            cerr << "[WARNING] Frame " << frame_idx << " size mismatch. Expected: " << video_size 
+                 << ", Got: " << pano.size() << ". Resizing..." << endl;
+            cv::resize(pano, pano, video_size);
         }
         
         // Write frame to video
         pano_writer.write(pano);
+        successful_frames++;
+        
+        // Verify writer is still working
+        if (!pano_writer.isOpened()) {
+            cerr << "[ERROR] Video writer closed unexpectedly at frame " << frame_idx << endl;
+            return false;
+        }
         
         // Save debug frame more frequently for debugging
         if (frame_idx % 30 == 0) {
             fs::create_directories("debug/output");
             cv::imwrite("debug/output/pano_" + to_string(frame_idx) + ".png", pano);
+            cout << "[DEBUG] Saved debug frame: pano_" << frame_idx << ".png" << endl;
         }
         
         // Clear frames to free memory
@@ -290,13 +325,15 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
         
         // Progress update
         if (frame_idx % 30 == 0) {
-            cout << "[INFO] Processed frame " << frame_idx << "/" << min_frames << endl;
+            cout << "[INFO] Processed frame " << frame_idx << "/" << min_frames 
+                 << " (successful: " << successful_frames << ")" << endl;
         }
     }
     
     if (writer_initialized) {
         pano_writer.release();
         cout << "[INFO] Panorama video saved: " << output_video_path << endl;
+        cout << "[INFO] Total successful frames written: " << successful_frames << "/" << min_frames << endl;
     }
     
     return true;
