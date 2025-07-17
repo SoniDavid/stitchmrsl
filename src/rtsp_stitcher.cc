@@ -186,16 +186,31 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
     for (int frame_idx = 0; frame_idx < min_frames; frame_idx++) {
         // Load synchronized frames
         vector<cv::Mat> frames(3);
+        vector<string> frame_paths(3);
         bool frames_loaded = true;
         
         for (int cam = 0; cam < 3; cam++) {
             stringstream ss;
             ss << frame_dirs[cam] << "/" << camera_names[cam] << "_" << setfill('0') << setw(6) << frame_idx << ".png";
-            string frame_path = ss.str();
+            frame_paths[cam] = ss.str();
             
-            frames[cam] = cv::imread(frame_path);
+            // Check if file exists first
+            if (!fs::exists(frame_paths[cam])) {
+                cerr << "[ERROR] Frame file does not exist: " << frame_paths[cam] << endl;
+                frames_loaded = false;
+                break;
+            }
+            
+            frames[cam] = cv::imread(frame_paths[cam], cv::IMREAD_COLOR);
             if (frames[cam].empty()) {
-                cerr << "[ERROR] Failed to load frame: " << frame_path << endl;
+                cerr << "[ERROR] Failed to load frame: " << frame_paths[cam] << endl;
+                frames_loaded = false;
+                break;
+            }
+            
+            // Verify frame dimensions
+            if (frames[cam].rows == 0 || frames[cam].cols == 0) {
+                cerr << "[ERROR] Invalid frame dimensions for: " << frame_paths[cam] << endl;
                 frames_loaded = false;
                 break;
             }
@@ -205,6 +220,20 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
             cerr << "[ERROR] Skipping frame " << frame_idx << " due to loading issues" << endl;
             continue;
         }
+        
+        // Debug: Save input frames for first few frames
+        if (frame_idx < 5) {
+            fs::create_directories("debug/input");
+            for (int cam = 0; cam < 3; cam++) {
+                string debug_path = "debug/input/" + camera_names[cam] + "_frame_" + to_string(frame_idx) + ".png";
+                cv::imwrite(debug_path, frames[cam]);
+            }
+            cout << "[DEBUG] Saved input frames for frame " << frame_idx << endl;
+        }
+        
+        // Create a fresh pipeline instance for each frame or clear existing state
+        // This ensures we're not reusing cached results
+        pipeline.SetBlendingMode(BlendingMode::AVERAGE);
         
         // Process through pipeline
         if (!pipeline.LoadTestImagesFromMats(frames)) {
@@ -218,6 +247,22 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
             cerr << "[WARNING] Empty panorama at frame " << frame_idx << endl;
             continue;
         }
+        
+        // Debug: Check if panorama is actually different
+        static cv::Mat prev_pano;
+        if (!prev_pano.empty() && frame_idx > 0) {
+            cv::Mat diff;
+            cv::absdiff(pano, prev_pano, diff);
+            cv::Scalar diff_sum = cv::sum(diff);
+            double total_diff = diff_sum[0] + diff_sum[1] + diff_sum[2];
+            
+            if (total_diff < 1000) { // Very small difference threshold
+                cerr << "[WARNING] Frame " << frame_idx << " is very similar to previous frame (diff: " << total_diff << ")" << endl;
+            } else {
+                cout << "[DEBUG] Frame " << frame_idx << " difference from previous: " << total_diff << endl;
+            }
+        }
+        prev_pano = pano.clone();
         
         // Initialize video writer on first successful frame
         if (!writer_initialized) {
@@ -237,8 +282,8 @@ bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output
             cout << "[INFO] Processed frame " << frame_idx << "/" << min_frames << endl;
         }
         
-        // Save debug frame occasionally
-        if (frame_idx % 150 == 0) {
+        // Save debug frame more frequently for debugging
+        if (frame_idx % 30 == 0) {
             fs::create_directories("debug");
             cv::imwrite("debug/pano_" + to_string(frame_idx) + ".png", pano);
         }
