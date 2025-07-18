@@ -18,12 +18,13 @@ using namespace std::chrono;
 namespace fs = std::filesystem;
 
 atomic<bool> stop_requested(false);
+atomic<bool> cameras_stopped(false);
 mutex cout_mutex;
 
 void signal_handler(int signal) {
     if (signal == SIGINT) {
         stop_requested = true;
-        cout << "\n[INFO] Ctrl+C received. Stopping capture and processing...\n";
+        cout << "\n[INFO] Ctrl+C received. Stopping capture and processing remaining frames...\n";
     }
 }
 
@@ -67,7 +68,7 @@ private:
     steady_clock::time_point latest_camera_start;
     map<int, steady_clock::time_point> camera_start_times;
     
-    static const int MAX_BUFFER_SIZE = 100;
+    static const int MAX_BUFFER_SIZE = 200; // Increased buffer size
     static const int SYNC_TOLERANCE_MS = 50; // 50ms tolerance for frame synchronization
     
     void tryCreateFrameSets() {
@@ -180,7 +181,7 @@ public:
         unique_lock<mutex> lock(buffer_mutex);
         
         if (buffer_cv.wait_for(lock, chrono::milliseconds(timeout_ms), 
-                              [this] { return !complete_sets.empty() || stop_requested; })) {
+                              [this] { return !complete_sets.empty() || (stop_requested && cameras_stopped); })) {
             if (!complete_sets.empty()) {
                 frame_set = complete_sets.front();
                 complete_sets.pop_front();
@@ -195,12 +196,38 @@ public:
         return complete_sets.size();
     }
     
+    size_t getTotalBufferedFrames() {
+        lock_guard<mutex> lock(buffer_mutex);
+        size_t total = complete_sets.size();
+        for (const auto& buffer : camera_buffers) {
+            total += buffer.second.size();
+        }
+        return total;
+    }
+    
+    bool hasFrames() {
+        lock_guard<mutex> lock(buffer_mutex);
+        if (!complete_sets.empty()) return true;
+        
+        for (const auto& buffer : camera_buffers) {
+            if (!buffer.second.empty()) return true;
+        }
+        return false;
+    }
+    
     void clear() {
         lock_guard<mutex> lock(buffer_mutex);
         complete_sets.clear();
         for (auto& buffer : camera_buffers) {
             buffer.second.clear();
         }
+    }
+    
+    void finalizeProcessing() {
+        lock_guard<mutex> lock(buffer_mutex);
+        // Try to create final frame sets from remaining frames
+        tryCreateFrameSets();
+        buffer_cv.notify_all();
     }
 };
 
@@ -215,6 +242,8 @@ private:
     steady_clock::time_point start_time;
     atomic<bool> is_running;
     int sequence_counter;
+    cv::VideoWriter raw_video_writer;
+    bool raw_writer_initialized;
     
     void captureLoop() {
         safe_cout("[CAM " + to_string(camera_id) + "] Starting capture from: " + rtsp_url);
@@ -251,6 +280,38 @@ private:
                 break;
             }
             
+            // Initialize raw video writer on first frame
+            if (!raw_writer_initialized && !frame.empty()) {
+                string raw_output_path = "output/camera_" + to_string(camera_id) + "_raw.mp4";
+                cv::Size frame_size = frame.size();
+                
+                // Try multiple codecs for raw footage
+                vector<pair<int, string>> codecs = {
+                    {cv::VideoWriter::fourcc('m', 'p', '4', 'v'), "MP4V"},
+                    {cv::VideoWriter::fourcc('X', 'V', 'I', 'D'), "XVID"},
+                    {cv::VideoWriter::fourcc('H', '2', '6', '4'), "H264"},
+                    {cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), "MJPG"}
+                };
+                
+                for (const auto& codec : codecs) {
+                    raw_video_writer.open(raw_output_path, codec.first, fps, frame_size);
+                    if (raw_video_writer.isOpened()) {
+                        safe_cout("[CAM " + to_string(camera_id) + "] Raw video writer initialized with codec: " + codec.second);
+                        raw_writer_initialized = true;
+                        break;
+                    }
+                }
+                
+                if (!raw_writer_initialized) {
+                    safe_cout("[CAM " + to_string(camera_id) + "] WARNING: Could not initialize raw video writer");
+                }
+            }
+            
+            // Save raw frame to video
+            if (raw_writer_initialized) {
+                raw_video_writer.write(frame);
+            }
+            
             auto timestamp = steady_clock::now();
             frame_buffer.addFrame(TimestampedFrame(frame, timestamp, camera_id, sequence_counter++));
             frame_count++;
@@ -264,13 +325,17 @@ private:
         }
         
         cap.release();
+        if (raw_writer_initialized) {
+            raw_video_writer.release();
+        }
         safe_cout("[CAM " + to_string(camera_id) + "] Stopped capture. Total frames: " + 
                   to_string(frame_count));
     }
     
 public:
     CameraCapture(int id, const string& url, SynchronizedFrameBuffer& buffer) 
-        : camera_id(id), rtsp_url(url), frame_buffer(buffer), is_running(false), sequence_counter(0) {}
+        : camera_id(id), rtsp_url(url), frame_buffer(buffer), is_running(false), 
+          sequence_counter(0), raw_writer_initialized(false) {}
     
     void start() {
         is_running.store(true);
@@ -355,7 +420,7 @@ public:
         int successful_frames = 0;
         auto processing_start = steady_clock::now();
         
-        while (!stop_requested) {
+        while (!stop_requested || frame_buffer.hasFrames()) {
             SynchronizedFrameBuffer::FrameSet frame_set;
             
             // Get next synchronized frame set
@@ -430,16 +495,26 @@ public:
                 processed_frames++;
                 
                 // Progress update
-                if (processed_frames % 150 == 0) {
+                if (processed_frames % 50 == 0) {
                     auto elapsed = duration_cast<seconds>(steady_clock::now() - processing_start).count();
                     auto queue_size = frame_buffer.getQueueSize();
+                    auto total_buffered = frame_buffer.getTotalBufferedFrames();
                     safe_cout("[INFO] Processed " + to_string(processed_frames) + 
                               " frames (" + to_string(successful_frames) + " successful) in " + 
-                              to_string(elapsed) + "s, Queue: " + to_string(queue_size));
+                              to_string(elapsed) + "s, Queue: " + to_string(queue_size) + 
+                              ", Total buffered: " + to_string(total_buffered));
                 }
             } else {
-                // No frames available, check if we should exit
-                if (stop_requested) break;
+                // No frames available
+                if (stop_requested && cameras_stopped && !frame_buffer.hasFrames()) {
+                    safe_cout("[INFO] No more frames to process, finishing...");
+                    break;
+                }
+                
+                // Show waiting message only if we're not stopping
+                if (!stop_requested) {
+                    safe_cout("[INFO] Waiting for frames...");
+                }
             }
         }
         
@@ -489,7 +564,7 @@ int main(int argc, char** argv) {
         this_thread::sleep_for(chrono::milliseconds(100));
     }
     
-    // Start processing immediately (remove synchronization delay)
+    // Start processing immediately
     thread processing_thread(&StitchingProcessor::processFrames, &processor);
     
     // Keep main thread alive
@@ -497,18 +572,30 @@ int main(int argc, char** argv) {
         this_thread::sleep_for(chrono::milliseconds(100));
     }
     
-    // Stop everything
+    // Stop cameras first
     cout << "[INFO] Stopping cameras..." << endl;
     for (auto& camera : cameras) {
         camera->stop();
     }
     
+    // Signal that cameras are stopped
+    cameras_stopped = true;
+    
+    // Finalize any remaining frames in buffers
+    sync_buffer.finalizeProcessing();
+    
+    // Wait for processing to complete
     if (processing_thread.joinable()) {
+        cout << "[INFO] Processing remaining frames..." << endl;
         processing_thread.join();
     }
     
     cout << "\n=== PROCESSING COMPLETE ===" << endl;
     cout << "Final panorama: output/panorama_synchronized.mp4" << endl;
+    cout << "Raw camera footage:" << endl;
+    cout << "  Camera 0 (left): output/camera_0_raw.mp4" << endl;
+    cout << "  Camera 1 (center): output/camera_1_raw.mp4" << endl;
+    cout << "  Camera 2 (right): output/camera_2_raw.mp4" << endl;
     cout << "Debug frames: debug/" << endl;
     
     return 0;
