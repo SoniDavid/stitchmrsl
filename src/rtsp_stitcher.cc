@@ -71,21 +71,13 @@ private:
     static const int SYNC_TOLERANCE_MS = 50; // 50ms tolerance for frame synchronization
     
     void tryCreateFrameSets() {
-        // Calculate how many frames each camera should skip based on start time offset
-        map<int, int> frames_to_skip;
-        for (const auto& pair : camera_start_times) {
-            int camera_id = pair.first;
-            auto start_time = pair.second;
-            auto offset_ms = duration_cast<milliseconds>(latest_camera_start - start_time).count();
-            frames_to_skip[camera_id] = max(0, static_cast<int>(offset_ms / 66.67)); // Assuming ~15fps
-        }
-        
+        // Simple synchronization: just check if all cameras have frames
         while (true) {
             bool can_create_set = true;
             
-            // Check if all cameras have enough frames
+            // Check if all cameras have at least one frame
             for (int cam = 0; cam < 3; cam++) {
-                if (camera_buffers[cam].size() <= static_cast<size_t>(frames_to_skip[cam])) {
+                if (camera_buffers[cam].empty()) {
                     can_create_set = false;
                     break;
                 }
@@ -93,13 +85,10 @@ private:
             
             if (!can_create_set) break;
             
-            // Find the reference time (earliest among the synchronized frames)
+            // Find the earliest timestamp among the first frames
             steady_clock::time_point ref_time = steady_clock::time_point::max();
-            vector<int> selected_indices(3);
-            
             for (int cam = 0; cam < 3; cam++) {
-                selected_indices[cam] = frames_to_skip[cam];
-                auto frame_time = camera_buffers[cam][selected_indices[cam]].timestamp;
+                auto frame_time = camera_buffers[cam].front().timestamp;
                 if (frame_time < ref_time) {
                     ref_time = frame_time;
                 }
@@ -108,16 +97,16 @@ private:
             // Create frame set with frames closest to reference time
             FrameSet frame_set;
             frame_set.reference_time = ref_time;
+            vector<int> selected_indices(3, 0);
             
             for (int cam = 0; cam < 3; cam++) {
-                // Find the frame closest to reference time
-                int best_idx = selected_indices[cam];
+                int best_idx = 0;
                 auto best_diff = abs(duration_cast<milliseconds>(
-                    camera_buffers[cam][best_idx].timestamp - ref_time).count());
+                    camera_buffers[cam][0].timestamp - ref_time).count());
                 
-                // Look for a better match within reasonable range
-                for (int i = selected_indices[cam]; i < min(selected_indices[cam] + 3, 
-                                                           static_cast<int>(camera_buffers[cam].size())); i++) {
+                // Look for the best matching frame within a reasonable window
+                int search_limit = min(5, static_cast<int>(camera_buffers[cam].size()));
+                for (int i = 1; i < search_limit; i++) {
                     auto diff = abs(duration_cast<milliseconds>(
                         camera_buffers[cam][i].timestamp - ref_time).count());
                     if (diff < best_diff) {
@@ -126,29 +115,18 @@ private:
                     }
                 }
                 
-                if (best_diff <= SYNC_TOLERANCE_MS) {
-                    frame_set.frames[cam] = camera_buffers[cam][best_idx];
-                } else {
-                    // Synchronization tolerance exceeded, skip this set
-                    break;
-                }
+                selected_indices[cam] = best_idx;
+                frame_set.frames[cam] = camera_buffers[cam][best_idx];
             }
             
-            // If we have all 3 synchronized frames, add to complete sets
-            if (!frame_set.frames[0].frame.empty() && 
-                !frame_set.frames[1].frame.empty() && 
-                !frame_set.frames[2].frame.empty()) {
-                frame_set.complete = true;
-                complete_sets.push_back(frame_set);
-            }
+            // Always add the frame set (remove strict synchronization requirement)
+            frame_set.complete = true;
+            complete_sets.push_back(frame_set);
             
-            // Remove processed frames from buffers
+            // Remove the oldest frame from each camera buffer
             for (int cam = 0; cam < 3; cam++) {
-                if (static_cast<size_t>(frames_to_skip[cam]) < camera_buffers[cam].size()) {
+                if (!camera_buffers[cam].empty()) {
                     camera_buffers[cam].pop_front();
-                    if (frames_to_skip[cam] > 0) {
-                        frames_to_skip[cam]--;
-                    }
                 }
             }
             
@@ -184,19 +162,16 @@ public:
     void addFrame(const TimestampedFrame& frame) {
         lock_guard<mutex> lock(buffer_mutex);
         
-        // Only add frames after sync start time
-        if (sync_start_time.time_since_epoch().count() > 0 && 
-            frame.timestamp >= sync_start_time) {
-            
-            camera_buffers[frame.camera_id].push_back(frame);
-            
-            // Limit individual camera buffer size
-            if (camera_buffers[frame.camera_id].size() > static_cast<size_t>(MAX_BUFFER_SIZE)) {
-                camera_buffers[frame.camera_id].pop_front();
-            }
-            
-            tryCreateFrameSets();
+        // Add frame to buffer (remove sync start time restriction)
+        camera_buffers[frame.camera_id].push_back(frame);
+        
+        // Limit individual camera buffer size
+        if (camera_buffers[frame.camera_id].size() > static_cast<size_t>(MAX_BUFFER_SIZE)) {
+            camera_buffers[frame.camera_id].pop_front();
         }
+        
+        // Try to create frame sets whenever we add a frame
+        tryCreateFrameSets();
         
         buffer_cv.notify_one();
     }
@@ -514,10 +489,7 @@ int main(int argc, char** argv) {
         this_thread::sleep_for(chrono::milliseconds(100));
     }
     
-    // Wait for synchronization setup
-    this_thread::sleep_for(chrono::milliseconds(2000));
-    
-    // Start processing in a separate thread
+    // Start processing immediately (remove synchronization delay)
     thread processing_thread(&StitchingProcessor::processFrames, &processor);
     
     // Keep main thread alive
