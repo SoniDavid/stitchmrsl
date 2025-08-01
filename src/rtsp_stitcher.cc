@@ -1,426 +1,431 @@
-// rtsp_stitcher.cpp
-#include "stitching.hh"
+// rtsp_stitcher.cc - Two-Phase Synchronized RTSP Stitching System
+#include "synchronized_capture.hh"
+#include "frame_synchronizer.hh"
+#include "cuda_stitching.hh"
 #include <opencv2/opencv.hpp>
+#include <iostream>
+#include <filesystem>
+#include <fstream>
 #include <csignal>
 #include <atomic>
-#include <thread>
-#include <filesystem>
-#include <iostream>
-#include <mutex>
-#include <iomanip>
-#include <sstream>
 #include <chrono>
+#include <thread>
+#include <iomanip>
 
-using namespace std;
 namespace fs = std::filesystem;
 
-atomic<bool> stop_requested(false);
+// Global variables for signal handling
+std::atomic<bool> g_stop_requested{false};
+std::unique_ptr<SynchronizedCapture> g_capture_system;
 
 void signal_handler(int signal) {
     if (signal == SIGINT) {
-        stop_requested = true;
-        cout << "\n[INFO] Ctrl+C received. Finishing current recording before exit...\n";
+        std::cout << "\n[INFO] Ctrl+C received. Stopping capture..." << std::endl;
+        g_stop_requested = true;
+        if (g_capture_system) {
+            g_capture_system->StopCapture();
+        }
     }
 }
 
-// Step 1: Capture RTSP streams and save as raw video files
-void CaptureRTSPToFile(const string& url, const string& output_path, int cam_id) {
-    cv::VideoCapture cap(url);
-    if (!cap.isOpened()) {
-        cerr << "[CAM " << cam_id << "] Failed to open: " << url << endl;
-        return;
-    }
+void print_usage(const char* program_name) {
+    std::cout << "Usage: " << program_name << " <mode> [options]" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Modes:" << std::endl;
+    std::cout << "  capture <rtsp1> <rtsp2> <rtsp3> [output_dir]" << std::endl;
+    std::cout << "    - Capture synchronized frames from 3 RTSP streams" << std::endl;
+    std::cout << "    - Default output_dir: ./output" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  process <metadata_dir> [output_video]" << std::endl;
+    std::cout << "    - Process captured frames into panorama video" << std::endl;
+    std::cout << "    - Default output_video: ./panorama_result.mp4" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  full <rtsp1> <rtsp2> <rtsp3> [output_dir] [output_video]" << std::endl;
+    std::cout << "    - Full pipeline: capture then process" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Examples:" << std::endl;
+    std::cout << "  " << program_name << " capture rtsp://192.168.1.10/stream rtsp://192.168.1.11/stream rtsp://192.168.1.12/stream" << std::endl;
+    std::cout << "  " << program_name << " process ./output" << std::endl;
+    std::cout << "  " << program_name << " full rtsp://cam1 rtsp://cam2 rtsp://cam3 ./data ./result.mp4" << std::endl;
+}
 
-    // Get video properties
-    double fps = cap.get(cv::CAP_PROP_FPS);
-    if (fps <= 0) fps = 15.0; // Default fallback
+bool load_metadata_files(const std::string& metadata_dir, 
+                        std::vector<std::vector<FrameMetadata>>& camera_metadata) {
     
-    int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-    int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    std::vector<std::string> camera_names = {"cam1", "cam2", "cam3"};
+    camera_metadata.resize(3);
     
-    cout << "[CAM " << cam_id << "] Properties: " << width << "x" << height << " @ " << fps << " FPS" << endl;
-    
-    // Create video writer
-    cv::VideoWriter writer(output_path, cv::VideoWriter::fourcc('a','v','c','1'), fps, cv::Size(width, height));
-    if (!writer.isOpened()) {
-        cerr << "[CAM " << cam_id << "] Failed to create video writer for: " << output_path << endl;
-        return;
+    for (int i = 0; i < 3; ++i) {
+        std::string metadata_file = metadata_dir + "/metadata/" + camera_names[i] + "_metadata.json";
+        
+        std::ifstream file(metadata_file);
+        if (!file.is_open()) {
+            std::cerr << "[ERROR] Failed to open metadata file: " << metadata_file << std::endl;
+            return false;
+        }
+        
+        nlohmann::json metadata_json;
+        file >> metadata_json;
+        
+        camera_metadata[i].clear();
+        for (const auto& item : metadata_json) {
+            camera_metadata[i].push_back(FrameMetadata::from_json(item));
+        }
+        
+        std::cout << "[INFO] Loaded " << camera_metadata[i].size() 
+                  << " frame metadata entries for " << camera_names[i] << std::endl;
     }
+    
+    return true;
+}
 
-    cout << "[CAM " << cam_id << "] Started recording to: " << output_path << endl;
+bool create_panorama_video(const std::vector<SyncedFrameTriplet>& synchronized_frames,
+                          const std::string& output_video_path) {
     
-    int frame_count = 0;
-    auto start_time = chrono::steady_clock::now();
+    if (synchronized_frames.empty()) {
+        std::cerr << "[ERROR] No synchronized frames to process" << std::endl;
+        return false;
+    }
     
-    while (!stop_requested) {
-        cv::Mat frame;
-        if (!cap.read(frame) || frame.empty()) {
-            cerr << "[CAM " << cam_id << "] Failed to read frame or stream ended" << endl;
+    std::cout << "[INFO] Creating panorama video with " << synchronized_frames.size() 
+              << " synchronized frames..." << std::endl;
+    
+    // Initialize CUDA stitching pipeline
+    CUDAStitchingPipeline cuda_pipeline;
+    
+    // Estimate input size from first frame
+    cv::Mat sample_frame = cv::imread(synchronized_frames[0].cam1_path);
+    if (sample_frame.empty()) {
+        std::cerr << "[ERROR] Failed to load sample frame: " << synchronized_frames[0].cam1_path << std::endl;
+        return false;
+    }
+    
+    cv::Size input_size = sample_frame.size();
+    std::cout << "[INFO] Input frame size: " << input_size << std::endl;
+    
+    // Initialize CUDA pipeline
+    if (!cuda_pipeline.Initialize(input_size)) {
+        std::cerr << "[ERROR] Failed to initialize CUDA pipeline" << std::endl;
+        return false;
+    }
+    
+    // Set feathering blend mode by default for better overlap handling
+    cuda_pipeline.SetBlendingMode(2); // 0=max, 1=average, 2=feathering
+    cuda_pipeline.SetFeatheringRadius(50); // 50 pixel feathering radius
+    
+    // Load calibration data
+    if (!cuda_pipeline.LoadCalibration("intrinsic.json", "extrinsic.json")) {
+        std::cerr << "[ERROR] Failed to load calibration data" << std::endl;
+        return false;
+    }
+    
+    // Process first frame to get output size
+    cv::Mat first_panorama = cuda_pipeline.ProcessFrameTriplet(
+        synchronized_frames[0].cam1_path,
+        synchronized_frames[0].cam2_path,
+        synchronized_frames[0].cam3_path
+    );
+    
+    if (first_panorama.empty()) {
+        std::cerr << "[ERROR] Failed to process first frame" << std::endl;
+        return false;
+    }
+    
+    cv::Size output_size = first_panorama.size();
+    std::cout << "[INFO] Output panorama size: " << output_size << std::endl;
+    
+    // Initialize video writer
+    double fps = 24.0; // Target FPS
+    int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+    cv::VideoWriter video_writer(output_video_path, fourcc, fps, output_size);
+    
+    if (!video_writer.isOpened()) {
+        std::cerr << "[ERROR] Failed to open video writer: " << output_video_path << std::endl;
+        return false;
+    }
+    
+    std::cout << "[INFO] Video writer initialized: " << output_video_path 
+              << " (" << output_size << " @ " << fps << " FPS)" << std::endl;
+    
+    // Write first frame
+    video_writer.write(first_panorama);
+    
+    // Process remaining frames
+    auto process_start = std::chrono::steady_clock::now();
+    size_t processed_frames = 1;
+    
+    for (size_t i = 1; i < synchronized_frames.size(); ++i) {
+        if (g_stop_requested) {
+            std::cout << "[INFO] Processing interrupted by user" << std::endl;
             break;
         }
         
-        writer.write(frame);
-        frame_count++;
+        auto frame_start = std::chrono::steady_clock::now();
         
-        // Progress update every 5 seconds
-        if (frame_count % (static_cast<int>(fps) * 5) == 0) {
-            auto elapsed = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - start_time).count();
-            cout << "[CAM " << cam_id << "] Recorded " << frame_count << " frames (" << elapsed << "s)" << endl;
+        cv::Mat panorama = cuda_pipeline.ProcessFrameTriplet(
+            synchronized_frames[i].cam1_path,
+            synchronized_frames[i].cam2_path,
+            synchronized_frames[i].cam3_path
+        );
+        
+        if (panorama.empty()) {
+            std::cerr << "[WARNING] Failed to process frame " << i << ", skipping..." << std::endl;
+            continue;
+        }
+        
+        // Ensure consistent size
+        if (panorama.size() != output_size) {
+            cv::resize(panorama, panorama, output_size);
+        }
+        
+        video_writer.write(panorama);
+        processed_frames++;
+        
+        // Progress reporting
+        if (i % 30 == 0 || i == synchronized_frames.size() - 1) {
+            auto frame_end = std::chrono::steady_clock::now();
+            double frame_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                frame_end - frame_start).count();
+            
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                frame_end - process_start).count();
+            double progress = (double)i / synchronized_frames.size() * 100.0;
+            double processing_fps = processed_frames / std::max(1.0, (double)elapsed);
+            
+            std::cout << "[INFO] Progress: " << std::fixed << std::setprecision(1) 
+                      << progress << "% (" << i << "/" << synchronized_frames.size() 
+                      << ") - Processing FPS: " << std::setprecision(1) << processing_fps
+                      << " - Frame time: " << std::setprecision(0) << frame_time << "ms" << std::endl;
         }
     }
     
-    writer.release();
-    cap.release();
-    cout << "[CAM " << cam_id << "] Stopped recording. Total frames: " << frame_count << endl;
-}
-
-// Step 2: Extract frames from video files
-bool ExtractFramesFromVideo(const string& video_path, const string& frames_dir, const string& prefix) {
-    cv::VideoCapture cap(video_path);
-    if (!cap.isOpened()) {
-        cerr << "[ERROR] Failed to open video: " << video_path << endl;
-        return false;
-    }
+    video_writer.release();
     
-    fs::create_directories(frames_dir);
+    auto process_end = std::chrono::steady_clock::now();
+    double total_time = std::chrono::duration_cast<std::chrono::seconds>(
+        process_end - process_start).count();
+    double avg_fps = processed_frames / std::max(1.0, total_time);
     
-    int frame_count = 0;
-    cv::Mat frame;
+    std::cout << "\n[INFO] ✅ Panorama video created successfully!" << std::endl;
+    std::cout << "[INFO] Output: " << output_video_path << std::endl;
+    std::cout << "[INFO] Processed frames: " << processed_frames << "/" << synchronized_frames.size() << std::endl;
+    std::cout << "[INFO] Total processing time: " << std::fixed << std::setprecision(1) << total_time << "s" << std::endl;
+    std::cout << "[INFO] Average processing FPS: " << std::setprecision(1) << avg_fps << std::endl;
     
-    cout << "[INFO] Extracting frames from: " << video_path << endl;
+    // Print CUDA pipeline statistics
+    auto cuda_stats = cuda_pipeline.GetStats();
+    std::cout << "[INFO] CUDA Pipeline Stats:" << std::endl;
+    std::cout << "[INFO]   Average processing time: " << std::fixed << std::setprecision(2) 
+              << cuda_stats.average_processing_time_ms << "ms per frame" << std::endl;
+    std::cout << "[INFO]   GPU memory used: ~" << cuda_stats.gpu_memory_used_mb << "MB" << std::endl;
     
-    while (cap.read(frame)) {
-        if (frame.empty()) break;
-        
-        // Create frame filename with zero-padded numbers
-        stringstream ss;
-        ss << frames_dir << "/" << prefix << "_" << setfill('0') << setw(6) << frame_count << ".png";
-        string frame_path = ss.str();
-        
-        if (!cv::imwrite(frame_path, frame)) {
-            cerr << "[ERROR] Failed to save frame: " << frame_path << endl;
-            cap.release();
-            return false;
-        }
-        
-        frame_count++;
-        
-        // Progress update
-        if (frame_count % 150 == 0) {
-            cout << "[INFO] Extracted " << frame_count << " frames from " << prefix << endl;
-        }
-    }
-    
-    cap.release();
-    cout << "[INFO] Finished extracting " << frame_count << " frames from " << prefix << endl;
     return true;
 }
 
-// Step 3: Process frames and create panorama video
-bool ProcessFramesToPanorama(const string& frames_base_dir, const string& output_video_path, 
-                           StitchingPipeline& pipeline, double fps = 15.0) {
+int mode_capture(int argc, char** argv) {
+    if (argc < 5) {
+        std::cerr << "[ERROR] Insufficient arguments for capture mode" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " capture <rtsp1> <rtsp2> <rtsp3> [output_dir]" << std::endl;
+        return -1;
+    }
     
-    // Find the minimum number of frames across all cameras
-    vector<string> camera_names = {"left", "central", "right"};
-    vector<string> frame_dirs = {
-        frames_base_dir + "/left",
-        frames_base_dir + "/central", 
-        frames_base_dir + "/right"
-    };
+    std::vector<std::string> rtsp_urls = {argv[2], argv[3], argv[4]};
+    std::string output_dir = (argc > 5) ? argv[5] : "./output";
     
-    int min_frames = INT_MAX;
-    for (const auto& dir : frame_dirs) {
-        int count = 0;
-        for (const auto& entry : fs::directory_iterator(dir)) {
-            if (entry.path().extension() == ".png") count++;
+    std::cout << "[INFO] === PHASE 1: SYNCHRONIZED CAPTURE ===" << std::endl;
+    std::cout << "[INFO] RTSP URLs:" << std::endl;
+    for (size_t i = 0; i < rtsp_urls.size(); ++i) {
+        std::cout << "[INFO]   Camera " << (i+1) << ": " << rtsp_urls[i] << std::endl;
+    }
+    std::cout << "[INFO] Output directory: " << output_dir << std::endl;
+    
+    // Initialize capture system
+    g_capture_system = std::make_unique<SynchronizedCapture>();
+    
+    // Start capture
+    if (!g_capture_system->CaptureAllStreams(rtsp_urls, output_dir)) {
+        std::cerr << "[ERROR] Failed to start capture" << std::endl;
+        return -1;
+    }
+    
+    std::cout << "[INFO] Capture started. Press Ctrl+C to stop..." << std::endl;
+    
+    // Wait for stop signal
+    while (!g_stop_requested) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        // Print statistics every 10 seconds
+        static auto last_stats_time = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stats_time).count() >= 10) {
+            auto stats = g_capture_system->GetStats();
+            std::cout << "[STATS] Frames captured: CAM1=" << stats.frames_captured[0] 
+                      << ", CAM2=" << stats.frames_captured[1] 
+                      << ", CAM3=" << stats.frames_captured[2] 
+                      << " | Dropped: " << stats.dropped_frames 
+                      << " | Duration: " << stats.total_duration.count() << "s" << std::endl;
+            last_stats_time = now;
         }
-        min_frames = min(min_frames, count);
-        cout << "[INFO] Found " << count << " frames in " << dir << endl;
     }
     
-    if (min_frames == 0) {
-        cerr << "[ERROR] No frames found in one or more directories" << endl;
-        return false;
+    // Save metadata
+    std::cout << "[INFO] Saving metadata..." << std::endl;
+    if (!g_capture_system->SaveMetadata(output_dir)) {
+        std::cerr << "[ERROR] Failed to save metadata" << std::endl;
+        return -1;
     }
     
-    cout << "[INFO] Processing " << min_frames << " synchronized frames" << endl;
+    // Final statistics
+    auto final_stats = g_capture_system->GetStats();
+    std::cout << "\n[INFO] ✅ Capture completed successfully!" << std::endl;
+    std::cout << "[INFO] Final Statistics:" << std::endl;
+    std::cout << "[INFO]   Total duration: " << final_stats.total_duration.count() << "s" << std::endl;
+    std::cout << "[INFO]   Frames captured: CAM1=" << final_stats.frames_captured[0] 
+              << ", CAM2=" << final_stats.frames_captured[1] 
+              << ", CAM3=" << final_stats.frames_captured[2] << std::endl;
+    std::cout << "[INFO]   Average FPS: CAM1=" << std::fixed << std::setprecision(1) << final_stats.average_fps[0]
+              << ", CAM2=" << final_stats.average_fps[1] 
+              << ", CAM3=" << final_stats.average_fps[2] << std::endl;
+    std::cout << "[INFO]   Dropped frames: " << final_stats.dropped_frames << std::endl;
+    std::cout << "[INFO] Raw frames saved in: " << output_dir << "/raw_frames/" << std::endl;
+    std::cout << "[INFO] Metadata saved in: " << output_dir << "/metadata/" << std::endl;
     
-    // Setup custom transformation matrices (same as original)
-    cv::Mat ab_custom = cv::Mat::eye(3, 3, CV_64F);
-    float ab_rad = 0.800f * CV_PI / 180.0f;
-    float ab_cos = cos(ab_rad);
-    float ab_sin = sin(ab_rad);
-    float ab_scale_x = 0.9877f;
-    float ab_scale_y = 1.0f;
-    float ab_translation_x = -2.8f;
-    float ab_translation_y = 0.0f;
+    return 0;
+}
 
-    ab_custom.at<double>(0, 0) = ab_cos * ab_scale_x; 
-    ab_custom.at<double>(0, 1) = -ab_sin * ab_scale_x;
-    ab_custom.at<double>(0, 2) = ab_translation_x; 
-    ab_custom.at<double>(1, 0) = ab_sin * ab_scale_y; 
-    ab_custom.at<double>(1, 1) = ab_cos * ab_scale_y;
-    ab_custom.at<double>(1, 2) = ab_translation_y; 
+int mode_process(int argc, char** argv) {
+    if (argc < 3) {
+        std::cerr << "[ERROR] Insufficient arguments for process mode" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " process <metadata_dir> [output_video]" << std::endl;
+        return -1;
+    }
     
-    cv::Mat bc_custom = cv::Mat::eye(3, 3, CV_64F);
-    float bc_rad = 0.800f * CV_PI / 180.0f;
-    float bc_cos = cos(bc_rad);
-    float bc_sin = sin(bc_rad);
-    float bc_scale_x = 1.0f;
-    float bc_scale_y = 1.0f;
-    float bc_translation_x = 21.1f;
-    float bc_translation_y = 0.0f;
+    std::string metadata_dir = argv[2];
+    std::string output_video = (argc > 3) ? argv[3] : "./panorama_result.mp4";
     
-    bc_custom.at<double>(0, 0) = bc_cos * bc_scale_x;
-    bc_custom.at<double>(0, 1) = -bc_sin * bc_scale_x;
-    bc_custom.at<double>(0, 2) = bc_translation_x; 
-    bc_custom.at<double>(1, 0) = bc_sin * bc_scale_y;
-    bc_custom.at<double>(1, 1) = bc_cos * bc_scale_y;
-    bc_custom.at<double>(1, 2) = bc_translation_y; 
+    std::cout << "[INFO] === PHASE 2: SYNCHRONIZED PROCESSING ===" << std::endl;
+    std::cout << "[INFO] Metadata directory: " << metadata_dir << std::endl;
+    std::cout << "[INFO] Output video: " << output_video << std::endl;
+    
+    // Load metadata
+    std::vector<std::vector<FrameMetadata>> camera_metadata;
+    if (!load_metadata_files(metadata_dir, camera_metadata)) {
+        std::cerr << "[ERROR] Failed to load metadata files" << std::endl;
+        return -1;
+    }
+    
+    // Synchronize frames
+    std::cout << "[INFO] Synchronizing frames..." << std::endl;
+    FrameSynchronizer synchronizer;
+    
+    // Configure synchronizer for post-processing (more lenient)
+    synchronizer.SetSyncWindow(std::chrono::milliseconds(50)); // 50ms window
+    synchronizer.SetMinSyncQuality(100.0); // 100ms max deviation
+    
+    auto synchronized_frames = synchronizer.FindOptimalSync(
+        camera_metadata[0], camera_metadata[1], camera_metadata[2]);
+    
+    if (synchronized_frames.empty()) {
+        std::cerr << "[ERROR] No synchronized frames found" << std::endl;
+        return -1;
+    }
+    
+    // Print synchronization statistics
+    auto sync_stats = synchronizer.GetSyncStats();
+    std::cout << "[INFO] Synchronization Results:" << std::endl;
+    std::cout << "[INFO]   Synchronized triplets: " << sync_stats.total_triplets_found << std::endl;
+    std::cout << "[INFO]   Perfect sync (<5ms): " << sync_stats.perfect_sync_triplets << std::endl;
+    std::cout << "[INFO]   Good sync (<16.7ms): " << sync_stats.good_sync_triplets << std::endl;
+    std::cout << "[INFO]   Average sync quality: " << std::fixed << std::setprecision(2) 
+              << sync_stats.average_sync_quality << "ms" << std::endl;
+    std::cout << "[INFO]   Effective FPS: " << std::setprecision(1) 
+              << sync_stats.effective_fps << std::endl;
+    
+    // Create panorama video
+    if (!create_panorama_video(synchronized_frames, output_video)) {
+        std::cerr << "[ERROR] Failed to create panorama video" << std::endl;
+        return -1;
+    }
+    
+    return 0;
+}
 
-    pipeline.SetBlendingMode(BlendingMode::AVERAGE);
-    
-    cv::VideoWriter pano_writer;
-    bool writer_initialized = false;
-    cv::Size video_size;
-    int successful_frames = 0;
-    
-    for (int frame_idx = 0; frame_idx < min_frames; frame_idx++) {
-        cout << "[INFO] Processing frame " << frame_idx << "/" << min_frames << endl;
-        
-        // CRITICAL: Clear pipeline cache before each frame
-        pipeline.ClearCache();
-        
-        // Load synchronized frames
-        vector<cv::Mat> frames(3);
-        vector<string> frame_paths(3);
-        bool frames_loaded = true;
-        
-        for (int cam = 0; cam < 3; cam++) {
-            stringstream ss;
-            ss << frame_dirs[cam] << "/" << camera_names[cam] << "_" << setfill('0') << setw(6) << frame_idx << ".png";
-            frame_paths[cam] = ss.str();
-            
-            // Check if file exists first
-            if (!fs::exists(frame_paths[cam])) {
-                cerr << "[ERROR] Frame file does not exist: " << frame_paths[cam] << endl;
-                frames_loaded = false;
-                break;
-            }
-            
-            frames[cam] = cv::imread(frame_paths[cam], cv::IMREAD_COLOR);
-            if (frames[cam].empty()) {
-                cerr << "[ERROR] Failed to load frame: " << frame_paths[cam] << endl;
-                frames_loaded = false;
-                break;
-            }
-            
-            // Verify frame dimensions
-            if (frames[cam].rows == 0 || frames[cam].cols == 0) {
-                cerr << "[ERROR] Invalid frame dimensions for: " << frame_paths[cam] << endl;
-                frames_loaded = false;
-                break;
-            }
-        }
-        
-        if (!frames_loaded) {
-            cerr << "[ERROR] Skipping frame " << frame_idx << " due to loading issues" << endl;
-            continue;
-        }
-        
-        // Debug: Save input frames for first few frames
-        if (frame_idx < 5) {
-            fs::create_directories("debug/input");
-            for (int cam = 0; cam < 3; cam++) {
-                string debug_path = "debug/input/" + camera_names[cam] + "_frame_" + to_string(frame_idx) + ".png";
-                cv::imwrite(debug_path, frames[cam]);
-            }
-            cout << "[DEBUG] Saved input frames for frame " << frame_idx << endl;
-        }
-        
-        // Load fresh frames into pipeline
-        if (!pipeline.LoadTestImagesFromMats(frames)) {
-            cerr << "[ERROR] Failed to load frames into pipeline for frame " << frame_idx << endl;
-            continue;
-        }
-        
-        // Generate panorama with fresh data
-        cv::Mat pano = pipeline.CreatePanoramaWithCustomTransforms(ab_custom, bc_custom);
-        if (pano.empty()) {
-            cerr << "[WARNING] Empty panorama at frame " << frame_idx << endl;
-            continue;
-        }
-        
-        // Debug: Check if panorama is actually different
-        static cv::Mat prev_pano;
-        if (!prev_pano.empty() && frame_idx > 0) {
-            cv::Mat diff;
-            cv::absdiff(pano, prev_pano, diff);
-            cv::Scalar diff_sum = cv::sum(diff);
-            double total_diff = diff_sum[0] + diff_sum[1] + diff_sum[2];
-            
-            if (total_diff < 1000) { // Very small difference threshold
-                cerr << "[WARNING] Frame " << frame_idx << " is very similar to previous frame (diff: " << total_diff << ")" << endl;
-            } else {
-                cout << "[DEBUG] Frame " << frame_idx << " difference from previous: " << total_diff << endl;
-            }
-        }
-        prev_pano = pano.clone();
-        
-        // Initialize video writer on first successful frame
-        if (!writer_initialized) {
-            video_size = pano.size();
-            
-            // Try multiple codecs in order of preference
-            vector<pair<int, string>> codecs = {
-                {cv::VideoWriter::fourcc('m', 'p', '4', 'v'), "MP4V"},
-                {cv::VideoWriter::fourcc('X', 'V', 'I', 'D'), "XVID"},
-                {cv::VideoWriter::fourcc('H', '2', '6', '4'), "H264"},
-                {cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), "MJPG"}
-            };
-            
-            for (const auto& codec : codecs) {
-                pano_writer.open(output_video_path, codec.first, fps, video_size);
-                if (pano_writer.isOpened()) {
-                    cout << "[INFO] Successfully initialized video writer with codec: " << codec.second << endl;
-                    cout << "[INFO] Video size: " << video_size << " @ " << fps << " FPS" << endl;
-                    writer_initialized = true;
-                    break;
-                }
-                cout << "[WARNING] Failed to initialize with codec: " << codec.second << endl;
-            }
-            
-            if (!writer_initialized) {
-                cerr << "[ERROR] Could not initialize video writer with any codec" << endl;
-                return false;
-            }
-        }
-        
-        // Ensure panorama size matches video size
-        if (pano.size() != video_size) {
-            cerr << "[WARNING] Frame " << frame_idx << " size mismatch. Expected: " << video_size 
-                 << ", Got: " << pano.size() << ". Resizing..." << endl;
-            cv::resize(pano, pano, video_size);
-        }
-        
-        // Write frame to video
-        pano_writer.write(pano);
-        successful_frames++;
-        
-        // Verify writer is still working
-        if (!pano_writer.isOpened()) {
-            cerr << "[ERROR] Video writer closed unexpectedly at frame " << frame_idx << endl;
-            return false;
-        }
-        
-        // Save debug frame more frequently for debugging
-        if (frame_idx % 30 == 0) {
-            fs::create_directories("debug/output");
-            cv::imwrite("debug/output/pano_" + to_string(frame_idx) + ".png", pano);
-            cout << "[DEBUG] Saved debug frame: pano_" << frame_idx << ".png" << endl;
-        }
-        
-        // Clear frames to free memory
-        frames.clear();
-        
-        // Progress update
-        if (frame_idx % 30 == 0) {
-            cout << "[INFO] Processed frame " << frame_idx << "/" << min_frames 
-                 << " (successful: " << successful_frames << ")" << endl;
-        }
+int mode_full(int argc, char** argv) {
+    if (argc < 5) {
+        std::cerr << "[ERROR] Insufficient arguments for full mode" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " full <rtsp1> <rtsp2> <rtsp3> [output_dir] [output_video]" << std::endl;
+        return -1;
     }
     
-    if (writer_initialized) {
-        pano_writer.release();
-        cout << "[INFO] Panorama video saved: " << output_video_path << endl;
-        cout << "[INFO] Total successful frames written: " << successful_frames << "/" << min_frames << endl;
+    std::string output_dir = (argc > 5) ? argv[5] : "./output";
+    std::string output_video = (argc > 6) ? argv[6] : "./panorama_result.mp4";
+    
+    std::cout << "[INFO] === FULL PIPELINE: CAPTURE + PROCESS ===" << std::endl;
+    
+    // Phase 1: Capture
+    std::cout << "\n" << std::string(60, '=') << std::endl;
+    std::cout << "PHASE 1: SYNCHRONIZED CAPTURE" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
+    
+    // Modify argv for capture mode
+    char* capture_argv[] = {argv[0], (char*)"capture", argv[2], argv[3], argv[4], (char*)output_dir.c_str()};
+    int capture_result = mode_capture(6, capture_argv);
+    
+    if (capture_result != 0) {
+        std::cerr << "[ERROR] Capture phase failed" << std::endl;
+        return capture_result;
     }
     
-    return true;
+    // Phase 2: Process
+    std::cout << "\n" << std::string(60, '=') << std::endl;
+    std::cout << "PHASE 2: SYNCHRONIZED PROCESSING" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
+    
+    // Reset stop signal for processing phase
+    g_stop_requested = false;
+    
+    // Modify argv for process mode
+    char* process_argv[] = {argv[0], (char*)"process", (char*)output_dir.c_str(), (char*)output_video.c_str()};
+    int process_result = mode_process(4, process_argv);
+    
+    if (process_result != 0) {
+        std::cerr << "[ERROR] Process phase failed" << std::endl;
+        return process_result;
+    }
+    
+    std::cout << "\n" << std::string(60, '=') << std::endl;
+    std::cout << "🎉 FULL PIPELINE COMPLETED SUCCESSFULLY!" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
+    std::cout << "[INFO] Raw frames: " << output_dir << "/raw_frames/" << std::endl;
+    std::cout << "[INFO] Metadata: " << output_dir << "/metadata/" << std::endl;
+    std::cout << "[INFO] Final video: " << output_video << std::endl;
+    
+    return 0;
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        cerr << "Usage: " << argv[0] << " <rtsp_left> <rtsp_center> <rtsp_right>" << endl;
-        return -1;
-    }
-
-    signal(SIGINT, signal_handler);
+    // Install signal handler
+    std::signal(SIGINT, signal_handler);
     
-    // Create directory structure
-    fs::create_directories("output/raw");
-    fs::create_directories("output/frames/left");
-    fs::create_directories("output/frames/central");
-    fs::create_directories("output/frames/right");
-    fs::create_directories("debug");
-
-    vector<string> rtsp_links = { argv[1], argv[2], argv[3] };
-    vector<string> raw_paths = {
-        "output/raw/left.mp4",
-        "output/raw/central.mp4",
-        "output/raw/right.mp4"
-    };
-    
-    cout << "\n=== STEP 1: CAPTURING RTSP STREAMS ===" << endl;
-    
-    // Step 1: Capture RTSP streams in parallel
-    vector<thread> capture_threads;
-    for (int i = 0; i < 3; ++i) {
-        capture_threads.emplace_back(CaptureRTSPToFile, rtsp_links[i], raw_paths[i], i);
-    }
-    
-    // Wait for all capture threads
-    for (auto& t : capture_threads) {
-        t.join();
-    }
-    
-    if (stop_requested) {
-        cout << "[INFO] Capture interrupted by user" << endl;
-    }
-    
-    cout << "\n=== STEP 2: EXTRACTING FRAMES ===" << endl;
-    
-    // Step 2: Extract frames from videos
-    vector<string> camera_names = {"left", "central", "right"};
-    vector<string> frame_dirs = {
-        "output/frames/left",
-        "output/frames/central",
-        "output/frames/right"
-    };
-    
-    for (int i = 0; i < 3; ++i) {
-        if (!fs::exists(raw_paths[i])) {
-            cerr << "[ERROR] Raw video not found: " << raw_paths[i] << endl;
-            continue;
-        }
-        
-        if (!ExtractFramesFromVideo(raw_paths[i], frame_dirs[i], camera_names[i])) {
-            cerr << "[ERROR] Failed to extract frames from: " << raw_paths[i] << endl;
-            return -1;
-        }
-    }
-    
-    cout << "\n=== STEP 3: PROCESSING PANORAMA ===" << endl;
-    
-    // Step 3: Load calibration and process frames
-    StitchingPipeline pipeline;
-    if (!pipeline.LoadIntrinsicsData("intrinsic.json") ||
-        !pipeline.LoadExtrinsicsData("extrinsic.json")) {
-        cerr << "[ERROR] Failed to load calibration data." << endl;
+    if (argc < 2) {
+        print_usage(argv[0]);
         return -1;
     }
     
-    double fps = 15.0; // You might want to read this from the original videos
-    if (!ProcessFramesToPanorama("output/frames", "output/panorama_result.mp4", pipeline, fps)) {
-        cerr << "[ERROR] Failed to create panorama video" << endl;
+    std::string mode = argv[1];
+    
+    std::cout << "[INFO] RTSP Stitcher v2.0 - Two-Phase Synchronized Processing" << std::endl;
+    std::cout << "[INFO] Mode: " << mode << std::endl;
+    
+    if (mode == "capture") {
+        return mode_capture(argc, argv);
+    } else if (mode == "process") {
+        return mode_process(argc, argv);
+    } else if (mode == "full") {
+        return mode_full(argc, argv);
+    } else {
+        std::cerr << "[ERROR] Unknown mode: " << mode << std::endl;
+        print_usage(argv[0]);
         return -1;
     }
-    
-    cout << "\n=== PROCESSING COMPLETE ===" << endl;
-    cout << "Raw videos: output/raw/ (MP4 format)" << endl;
-    cout << "Extracted frames: output/frames/" << endl;
-    cout << "Final panorama: output/panorama_result.mp4" << endl;
-    cout << "Debug frames: debug/" << endl;
-    
-    return 0;
 }
