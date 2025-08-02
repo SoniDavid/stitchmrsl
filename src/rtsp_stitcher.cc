@@ -1,602 +1,511 @@
-// rtsp_stitcher_buffered.cpp
-#include "stitching.hh"
+// rtsp_stitcher.cc - Two-Phase Synchronized RTSP Stitching System
+#include "synchronized_capture.hh"
+#include "frame_synchronizer.hh"
+#include "cuda_stitching.hh"
 #include <opencv2/opencv.hpp>
+#include <iostream>
+#include <filesystem>
+#include <fstream>
 #include <csignal>
 #include <atomic>
-#include <thread>
-#include <filesystem>
-#include <iostream>
-#include <mutex>
-#include <queue>
-#include <condition_variable>
 #include <chrono>
-#include <map>
-#include <deque>
+#include <thread>
+#include <iomanip>
 
-using namespace std;
-using namespace std::chrono;
 namespace fs = std::filesystem;
 
-atomic<bool> stop_requested(false);
-atomic<bool> cameras_stopped(false);
-mutex cout_mutex;
+// Global variables for signal handling
+std::atomic<bool> g_stop_requested{false};
+std::unique_ptr<SynchronizedCapture> g_capture_system;
 
 void signal_handler(int signal) {
     if (signal == SIGINT) {
-        stop_requested = true;
-        cout << "\n[INFO] Ctrl+C received. Stopping capture and processing remaining frames...\n";
+        std::cout << "\n[INFO] Ctrl+C received. Stopping capture..." << std::endl;
+        g_stop_requested = true;
+        if (g_capture_system) {
+            g_capture_system->StopCapture();
+        }
     }
 }
 
-void safe_cout(const string& message) {
-    lock_guard<mutex> lock(cout_mutex);
-    cout << message << endl;
+void print_usage(const char* program_name) {
+    std::cout << "Usage: " << program_name << " <mode> [options]" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Modes:" << std::endl;
+    std::cout << "  capture <rtsp1> <rtsp2> <rtsp3> [output_dir]" << std::endl;
+    std::cout << "    - Capture synchronized frames from 3 RTSP streams" << std::endl;
+    std::cout << "    - Default output_dir: ./output" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  process <metadata_dir> [output_video]" << std::endl;
+    std::cout << "    - Process captured frames into panorama video" << std::endl;
+    std::cout << "    - Default output_video: ./panorama_result.mp4" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  full <rtsp1> <rtsp2> <rtsp3> [output_dir] [output_video]" << std::endl;
+    std::cout << "    - Full pipeline: capture then process" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Examples:" << std::endl;
+    std::cout << "  " << program_name << " capture rtsp://192.168.1.10/stream rtsp://192.168.1.11/stream rtsp://192.168.1.12/stream" << std::endl;
+    std::cout << "  " << program_name << " process ./output" << std::endl;
+    std::cout << "  " << program_name << " full rtsp://cam1 rtsp://cam2 rtsp://cam3 ./data ./result.mp4" << std::endl;
 }
 
-// Structure to hold a frame with timestamp and sequence number
-struct TimestampedFrame {
-    cv::Mat frame;
-    steady_clock::time_point timestamp;
-    int camera_id;
-    int sequence_number;
+bool load_metadata_files(const std::string& metadata_dir, 
+                        std::vector<std::vector<FrameMetadata>>& camera_metadata) {
     
-    TimestampedFrame() = default;
-    TimestampedFrame(const cv::Mat& f, steady_clock::time_point t, int id, int seq) 
-        : frame(f.clone()), timestamp(t), camera_id(id), sequence_number(seq) {}
-};
-
-// Thread-safe synchronized frame buffer
-class SynchronizedFrameBuffer {
-public:
-    struct FrameSet {
-        vector<TimestampedFrame> frames;
-        steady_clock::time_point reference_time;
-        bool complete;
+    std::vector<std::string> camera_names = {"cam1", "cam2", "cam3"};
+    camera_metadata.resize(3);
+    
+    for (int i = 0; i < 3; ++i) {
+        std::string metadata_file = metadata_dir + "/metadata/" + camera_names[i] + "_metadata.json";
         
-        FrameSet() : complete(false) {
-            frames.resize(3);
-        }
-    };
-    
-private:
-    deque<FrameSet> complete_sets;
-    map<int, deque<TimestampedFrame>> camera_buffers;
-    mutex buffer_mutex;
-    condition_variable buffer_cv;
-    
-    steady_clock::time_point sync_start_time;
-    steady_clock::time_point latest_camera_start;
-    map<int, steady_clock::time_point> camera_start_times;
-    
-    static const int MAX_BUFFER_SIZE = 200; // Increased buffer size
-    static const int SYNC_TOLERANCE_MS = 50; // 50ms tolerance for frame synchronization
-    
-    void tryCreateFrameSets() {
-        // Simple synchronization: just check if all cameras have frames
-        while (true) {
-            bool can_create_set = true;
-            
-            // Check if all cameras have at least one frame
-            for (int cam = 0; cam < 3; cam++) {
-                if (camera_buffers[cam].empty()) {
-                    can_create_set = false;
-                    break;
-                }
-            }
-            
-            if (!can_create_set) break;
-            
-            // Find the earliest timestamp among the first frames
-            steady_clock::time_point ref_time = steady_clock::time_point::max();
-            for (int cam = 0; cam < 3; cam++) {
-                auto frame_time = camera_buffers[cam].front().timestamp;
-                if (frame_time < ref_time) {
-                    ref_time = frame_time;
-                }
-            }
-            
-            // Create frame set with frames closest to reference time
-            FrameSet frame_set;
-            frame_set.reference_time = ref_time;
-            vector<int> selected_indices(3, 0);
-            
-            for (int cam = 0; cam < 3; cam++) {
-                int best_idx = 0;
-                auto best_diff = abs(duration_cast<milliseconds>(
-                    camera_buffers[cam][0].timestamp - ref_time).count());
-                
-                // Look for the best matching frame within a reasonable window
-                int search_limit = min(5, static_cast<int>(camera_buffers[cam].size()));
-                for (int i = 1; i < search_limit; i++) {
-                    auto diff = abs(duration_cast<milliseconds>(
-                        camera_buffers[cam][i].timestamp - ref_time).count());
-                    if (diff < best_diff) {
-                        best_diff = diff;
-                        best_idx = i;
-                    }
-                }
-                
-                selected_indices[cam] = best_idx;
-                frame_set.frames[cam] = camera_buffers[cam][best_idx];
-            }
-            
-            // Always add the frame set (remove strict synchronization requirement)
-            frame_set.complete = true;
-            complete_sets.push_back(frame_set);
-            
-            // Remove the oldest frame from each camera buffer
-            for (int cam = 0; cam < 3; cam++) {
-                if (!camera_buffers[cam].empty()) {
-                    camera_buffers[cam].pop_front();
-                }
-            }
-            
-            // Limit complete sets buffer size
-            if (complete_sets.size() > static_cast<size_t>(MAX_BUFFER_SIZE)) {
-                complete_sets.pop_front();
-            }
-        }
-    }
-    
-public:
-    SynchronizedFrameBuffer() {
-        for (int i = 0; i < 3; i++) {
-            camera_buffers[i] = deque<TimestampedFrame>();
-        }
-    }
-    
-    void setCameraStartTime(int camera_id, steady_clock::time_point start_time) {
-        lock_guard<mutex> lock(buffer_mutex);
-        camera_start_times[camera_id] = start_time;
-        
-        // Update latest start time
-        if (start_time > latest_camera_start) {
-            latest_camera_start = start_time;
-        }
-        
-        // If all cameras have reported their start times, set sync start
-        if (camera_start_times.size() == 3) {
-            sync_start_time = latest_camera_start + chrono::milliseconds(100); // Small buffer
-        }
-    }
-    
-    void addFrame(const TimestampedFrame& frame) {
-        lock_guard<mutex> lock(buffer_mutex);
-        
-        // Add frame to buffer (remove sync start time restriction)
-        camera_buffers[frame.camera_id].push_back(frame);
-        
-        // Limit individual camera buffer size
-        if (camera_buffers[frame.camera_id].size() > static_cast<size_t>(MAX_BUFFER_SIZE)) {
-            camera_buffers[frame.camera_id].pop_front();
-        }
-        
-        // Try to create frame sets whenever we add a frame
-        tryCreateFrameSets();
-        
-        buffer_cv.notify_one();
-    }
-    
-    bool getFrameSet(FrameSet& frame_set, int timeout_ms = 1000) {
-        unique_lock<mutex> lock(buffer_mutex);
-        
-        if (buffer_cv.wait_for(lock, chrono::milliseconds(timeout_ms), 
-                              [this] { return !complete_sets.empty() || (stop_requested && cameras_stopped); })) {
-            if (!complete_sets.empty()) {
-                frame_set = complete_sets.front();
-                complete_sets.pop_front();
-                return true;
-            }
-        }
-        return false;
-    }
-    
-    size_t getQueueSize() {
-        lock_guard<mutex> lock(buffer_mutex);
-        return complete_sets.size();
-    }
-    
-    size_t getTotalBufferedFrames() {
-        lock_guard<mutex> lock(buffer_mutex);
-        size_t total = complete_sets.size();
-        for (const auto& buffer : camera_buffers) {
-            total += buffer.second.size();
-        }
-        return total;
-    }
-    
-    bool hasFrames() {
-        lock_guard<mutex> lock(buffer_mutex);
-        if (!complete_sets.empty()) return true;
-        
-        for (const auto& buffer : camera_buffers) {
-            if (!buffer.second.empty()) return true;
-        }
-        return false;
-    }
-    
-    void clear() {
-        lock_guard<mutex> lock(buffer_mutex);
-        complete_sets.clear();
-        for (auto& buffer : camera_buffers) {
-            buffer.second.clear();
-        }
-    }
-    
-    void finalizeProcessing() {
-        lock_guard<mutex> lock(buffer_mutex);
-        // Try to create final frame sets from remaining frames
-        tryCreateFrameSets();
-        buffer_cv.notify_all();
-    }
-};
-
-// Camera capture class
-class CameraCapture {
-private:
-    cv::VideoCapture cap;
-    int camera_id;
-    string rtsp_url;
-    SynchronizedFrameBuffer& frame_buffer;
-    thread capture_thread;
-    steady_clock::time_point start_time;
-    atomic<bool> is_running;
-    int sequence_counter;
-    cv::VideoWriter raw_video_writer;
-    bool raw_writer_initialized;
-    
-    void captureLoop() {
-        safe_cout("[CAM " + to_string(camera_id) + "] Starting capture from: " + rtsp_url);
-        
-        if (!cap.open(rtsp_url)) {
-            safe_cout("[CAM " + to_string(camera_id) + "] Failed to open RTSP stream");
-            return;
-        }
-        
-        // Set minimal buffer to reduce latency
-        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-        
-        double fps = cap.get(cv::CAP_PROP_FPS);
-        if (fps <= 0) fps = 15.0;
-        
-        int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-        int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-        
-        safe_cout("[CAM " + to_string(camera_id) + "] Properties: " + 
-                  to_string(width) + "x" + to_string(height) + " @ " + 
-                  to_string(fps) + " FPS");
-        
-        // Record actual start time
-        start_time = steady_clock::now();
-        frame_buffer.setCameraStartTime(camera_id, start_time);
-        
-        sequence_counter = 0;
-        int frame_count = 0;
-        
-        while (!stop_requested && is_running.load()) {
-            cv::Mat frame;
-            if (!cap.read(frame) || frame.empty()) {
-                safe_cout("[CAM " + to_string(camera_id) + "] Failed to read frame or stream ended");
-                break;
-            }
-            
-            // Initialize raw video writer on first frame
-            if (!raw_writer_initialized && !frame.empty()) {
-                string raw_output_path = "output/camera_" + to_string(camera_id) + "_raw.mp4";
-                cv::Size frame_size = frame.size();
-                
-                // Try multiple codecs for raw footage
-                vector<pair<int, string>> codecs = {
-                    {cv::VideoWriter::fourcc('m', 'p', '4', 'v'), "MP4V"},
-                    {cv::VideoWriter::fourcc('X', 'V', 'I', 'D'), "XVID"},
-                    {cv::VideoWriter::fourcc('H', '2', '6', '4'), "H264"},
-                    {cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), "MJPG"}
-                };
-                
-                for (const auto& codec : codecs) {
-                    raw_video_writer.open(raw_output_path, codec.first, fps, frame_size);
-                    if (raw_video_writer.isOpened()) {
-                        safe_cout("[CAM " + to_string(camera_id) + "] Raw video writer initialized with codec: " + codec.second);
-                        raw_writer_initialized = true;
-                        break;
-                    }
-                }
-                
-                if (!raw_writer_initialized) {
-                    safe_cout("[CAM " + to_string(camera_id) + "] WARNING: Could not initialize raw video writer");
-                }
-            }
-            
-            // Save raw frame to video
-            if (raw_writer_initialized) {
-                raw_video_writer.write(frame);
-            }
-            
-            auto timestamp = steady_clock::now();
-            frame_buffer.addFrame(TimestampedFrame(frame, timestamp, camera_id, sequence_counter++));
-            frame_count++;
-            
-            // Progress update every 5 seconds
-            if (frame_count % (static_cast<int>(fps) * 5) == 0) {
-                auto elapsed = duration_cast<seconds>(timestamp - start_time).count();
-                safe_cout("[CAM " + to_string(camera_id) + "] Captured " + 
-                          to_string(frame_count) + " frames (" + to_string(elapsed) + "s)");
-            }
-        }
-        
-        cap.release();
-        if (raw_writer_initialized) {
-            raw_video_writer.release();
-        }
-        safe_cout("[CAM " + to_string(camera_id) + "] Stopped capture. Total frames: " + 
-                  to_string(frame_count));
-    }
-    
-public:
-    CameraCapture(int id, const string& url, SynchronizedFrameBuffer& buffer) 
-        : camera_id(id), rtsp_url(url), frame_buffer(buffer), is_running(false), 
-          sequence_counter(0), raw_writer_initialized(false) {}
-    
-    void start() {
-        is_running.store(true);
-        capture_thread = thread(&CameraCapture::captureLoop, this);
-    }
-    
-    void stop() {
-        is_running.store(false);
-        if (capture_thread.joinable()) {
-            capture_thread.join();
-        }
-    }
-};
-
-// Stitching processor class
-class StitchingProcessor {
-private:
-    SynchronizedFrameBuffer& frame_buffer;
-    StitchingPipeline pipeline;
-    cv::VideoWriter video_writer;
-    string output_path;
-    double target_fps;
-    bool writer_initialized;
-    
-    // Custom transformation matrices
-    cv::Mat ab_custom, bc_custom;
-    
-    void initializeTransforms() {
-        ab_custom = cv::Mat::eye(3, 3, CV_64F);
-        float ab_rad = 0.800f * CV_PI / 180.0f;
-        float ab_cos = cos(ab_rad);
-        float ab_sin = sin(ab_rad);
-        float ab_scale_x = 0.9877f;
-        float ab_scale_y = 1.0f;
-        float ab_translation_x = -2.8f;
-        float ab_translation_y = 0.0f;
-
-        ab_custom.at<double>(0, 0) = ab_cos * ab_scale_x; 
-        ab_custom.at<double>(0, 1) = -ab_sin * ab_scale_x;
-        ab_custom.at<double>(0, 2) = ab_translation_x; 
-        ab_custom.at<double>(1, 0) = ab_sin * ab_scale_y; 
-        ab_custom.at<double>(1, 1) = ab_cos * ab_scale_y;
-        ab_custom.at<double>(1, 2) = ab_translation_y; 
-        
-        bc_custom = cv::Mat::eye(3, 3, CV_64F);
-        float bc_rad = 0.800f * CV_PI / 180.0f;
-        float bc_cos = cos(bc_rad);
-        float bc_sin = sin(bc_rad);
-        float bc_scale_x = 1.0f;
-        float bc_scale_y = 1.0f;
-        float bc_translation_x = 21.1f;
-        float bc_translation_y = 0.0f;
-        
-        bc_custom.at<double>(0, 0) = bc_cos * bc_scale_x;
-        bc_custom.at<double>(0, 1) = -bc_sin * bc_scale_x;
-        bc_custom.at<double>(0, 2) = bc_translation_x; 
-        bc_custom.at<double>(1, 0) = bc_sin * bc_scale_y;
-        bc_custom.at<double>(1, 1) = bc_cos * bc_scale_y;
-        bc_custom.at<double>(1, 2) = bc_translation_y; 
-    }
-    
-public:
-    StitchingProcessor(SynchronizedFrameBuffer& buffer, const string& output, double fps = 15.0) 
-        : frame_buffer(buffer), output_path(output), target_fps(fps), writer_initialized(false) {
-        initializeTransforms();
-        pipeline.SetBlendingMode(BlendingMode::AVERAGE);
-    }
-    
-    bool initialize() {
-        if (!pipeline.LoadIntrinsicsData("intrinsic.json") ||
-            !pipeline.LoadExtrinsicsData("extrinsic.json")) {
-            safe_cout("[ERROR] Failed to load calibration data.");
+        std::ifstream file(metadata_file);
+        if (!file.is_open()) {
+            std::cerr << "[ERROR] Failed to open metadata file: " << metadata_file << std::endl;
             return false;
         }
-        return true;
+        
+        nlohmann::json metadata_json;
+        file >> metadata_json;
+        
+        camera_metadata[i].clear();
+        for (const auto& item : metadata_json) {
+            camera_metadata[i].push_back(FrameMetadata::from_json(item));
+        }
+        
+        std::cout << "[INFO] Loaded " << camera_metadata[i].size() 
+                  << " frame metadata entries for " << camera_names[i] << std::endl;
     }
     
-    void processFrames() {
-        safe_cout("[INFO] Starting frame processing...");
+    return true;
+}
+
+bool create_panorama_video(const std::vector<SyncedFrameTriplet>& synchronized_frames,
+                          const std::string& output_video_path) {
+    
+    if (synchronized_frames.empty()) {
+        std::cerr << "[ERROR] No synchronized frames found" << std::endl;
+        return false;
+    }
+    
+    std::cout << "[INFO] Creating panorama video with " << synchronized_frames.size() 
+              << " synchronized frames..." << std::endl;
+    
+    // Initialize CUDA stitching pipeline
+    CUDAStitchingPipeline cuda_pipeline;
+    
+    // Estimate input size from first frame
+    cv::Mat sample_frame = cv::imread(synchronized_frames[0].cam1_path);
+    if (sample_frame.empty()) {
+        std::cerr << "[ERROR] Failed to load sample frame: " << synchronized_frames[0].cam1_path << std::endl;
+        return false;
+    }
+    
+    cv::Size input_size = sample_frame.size();
+    std::cout << "[INFO] Input frame size: " << input_size << std::endl;
+    
+    // Initialize CUDA pipeline
+    if (!cuda_pipeline.Initialize(input_size)) {
+        std::cerr << "[ERROR] Failed to initialize CUDA pipeline" << std::endl;
+        return false;
+    }
+    
+    // Set feathering blend mode by default for better overlap handling
+    cuda_pipeline.SetBlendingMode(2); // 0=max, 1=average, 2=feathering
+    cuda_pipeline.SetFeatheringRadius(50); // 50 pixel feathering radius
+    
+    // Load calibration data
+    if (!cuda_pipeline.LoadCalibration("intrinsic.json", "extrinsic.json")) {
+        std::cerr << "[ERROR] Failed to load calibration data" << std::endl;
+        return false;
+    }
+    
+    // Process first frame to get output size and rectified frames
+    cv::Mat first_panorama = cuda_pipeline.ProcessFrameTriplet(
+        synchronized_frames[0].cam1_path,
+        synchronized_frames[0].cam2_path,
+        synchronized_frames[0].cam3_path
+    );
+    
+    if (first_panorama.empty()) {
+        std::cerr << "[ERROR] Failed to process first frame" << std::endl;
+        return false;
+    }
+    
+    // Get first rectified frames to determine their size
+    std::vector<cv::Mat> first_rectified = cuda_pipeline.GetRectifiedFrames(
+        synchronized_frames[0].cam1_path,
+        synchronized_frames[0].cam2_path,
+        synchronized_frames[0].cam3_path
+    );
+    
+    if (first_rectified[0].empty()) {
+        std::cerr << "[ERROR] Failed to get rectified frames" << std::endl;
+        return false;
+    }
+    
+    cv::Size output_size = first_panorama.size();
+    cv::Size rectified_size = first_rectified[0].size();
+    std::cout << "[INFO] Output panorama size: " << output_size << std::endl;
+    std::cout << "[INFO] Rectified frame size: " << rectified_size << std::endl;
+    
+    // Initialize video writers
+    double fps = 24.0; // Target FPS
+    int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+    
+    // Panorama video writer
+    cv::VideoWriter panorama_writer(output_video_path, fourcc, fps, output_size);
+    if (!panorama_writer.isOpened()) {
+        std::cerr << "[ERROR] Failed to open panorama video writer: " << output_video_path << std::endl;
+        return false;
+    }
+    
+    // Individual rectified video writers
+    std::vector<cv::VideoWriter> rectified_writers(3);
+    std::vector<std::string> camera_names = {"cam1", "cam2", "cam3"};
+    
+    for (int i = 0; i < 3; ++i) {
+        // Create output path for each camera's rectified video
+        std::string rectified_path = output_video_path;
+        size_t dot_pos = rectified_path.find_last_of('.');
+        if (dot_pos != std::string::npos) {
+            rectified_path = rectified_path.substr(0, dot_pos) + "_" + camera_names[i] + "_rectified" + rectified_path.substr(dot_pos);
+        } else {
+            rectified_path += "_" + camera_names[i] + "_rectified.mp4";
+        }
         
-        int processed_frames = 0;
-        int successful_frames = 0;
-        auto processing_start = steady_clock::now();
+        rectified_writers[i].open(rectified_path, fourcc, fps, rectified_size);
+        if (!rectified_writers[i].isOpened()) {
+            std::cerr << "[ERROR] Failed to open rectified video writer for " << camera_names[i] << ": " << rectified_path << std::endl;
+            return false;
+        }
         
-        while (!stop_requested || frame_buffer.hasFrames()) {
-            SynchronizedFrameBuffer::FrameSet frame_set;
-            
-            // Get next synchronized frame set
-            if (frame_buffer.getFrameSet(frame_set, 1000)) {
-                auto process_start = steady_clock::now();
-                
-                // Clear pipeline cache
-                pipeline.ClearCache();
-                
-                // Extract cv::Mat frames
-                vector<cv::Mat> frames;
-                for (const auto& ts_frame : frame_set.frames) {
-                    frames.push_back(ts_frame.frame);
-                }
-                
-                // Load frames into pipeline
-                if (pipeline.LoadTestImagesFromMats(frames)) {
-                    // Generate panorama
-                    cv::Mat pano = pipeline.CreatePanoramaWithCustomTransforms(ab_custom, bc_custom);
-                    
-                    if (!pano.empty()) {
-                        // Initialize video writer on first successful frame
-                        if (!writer_initialized) {
-                            cv::Size video_size = pano.size();
-                            
-                            // Try multiple codecs
-                            vector<pair<int, string>> codecs = {
-                                {cv::VideoWriter::fourcc('m', 'p', '4', 'v'), "MP4V"},
-                                {cv::VideoWriter::fourcc('X', 'V', 'I', 'D'), "XVID"},
-                                {cv::VideoWriter::fourcc('H', '2', '6', '4'), "H264"},
-                                {cv::VideoWriter::fourcc('M', 'J', 'P', 'G'), "MJPG"}
-                            };
-                            
-                            for (const auto& codec : codecs) {
-                                video_writer.open(output_path, codec.first, target_fps, video_size);
-                                if (video_writer.isOpened()) {
-                                    safe_cout("[INFO] Video writer initialized with codec: " + codec.second);
-                                    safe_cout("[INFO] Video size: " + to_string(video_size.width) + "x" + 
-                                              to_string(video_size.height) + " @ " + to_string(target_fps) + " FPS");
-                                    writer_initialized = true;
-                                    break;
-                                }
-                            }
-                            
-                            if (!writer_initialized) {
-                                safe_cout("[ERROR] Could not initialize video writer");
-                                return;
-                            }
-                        }
-                        
-                        // Write frame to video
-                        video_writer.write(pano);
-                        successful_frames++;
-                        
-                        // Save debug frames periodically
-                        if (processed_frames % 150 == 0) {
-                            fs::create_directories("debug");
-                            cv::imwrite("debug/pano_" + to_string(processed_frames) + ".png", pano);
-                        }
-                        
-                        auto process_end = steady_clock::now();
-                        auto process_time = duration_cast<milliseconds>(process_end - process_start).count();
-                        
-                        // Monitor processing performance
-                        if (process_time > 66) { // More than one frame time at 15fps
-                            safe_cout("[WARNING] Frame " + to_string(processed_frames) + 
-                                      " took " + to_string(process_time) + "ms to process");
-                        }
-                    }
-                }
-                
-                processed_frames++;
-                
-                // Progress update
-                if (processed_frames % 50 == 0) {
-                    auto elapsed = duration_cast<seconds>(steady_clock::now() - processing_start).count();
-                    auto queue_size = frame_buffer.getQueueSize();
-                    auto total_buffered = frame_buffer.getTotalBufferedFrames();
-                    safe_cout("[INFO] Processed " + to_string(processed_frames) + 
-                              " frames (" + to_string(successful_frames) + " successful) in " + 
-                              to_string(elapsed) + "s, Queue: " + to_string(queue_size) + 
-                              ", Total buffered: " + to_string(total_buffered));
-                }
-            } else {
-                // No frames available
-                if (stop_requested && cameras_stopped && !frame_buffer.hasFrames()) {
-                    safe_cout("[INFO] No more frames to process, finishing...");
-                    break;
-                }
-                
-                // Show waiting message only if we're not stopping
-                if (!stop_requested) {
-                    safe_cout("[INFO] Waiting for frames...");
-                }
+        std::cout << "[INFO] Rectified video writer initialized for " << camera_names[i] << ": " << rectified_path << std::endl;
+    }
+    
+    std::cout << "[INFO] Video writers initialized" << std::endl;
+    
+    // Write first frames
+    panorama_writer.write(first_panorama);
+    for (int i = 0; i < 3; ++i) {
+        rectified_writers[i].write(first_rectified[i]);
+    }
+    
+    // Process remaining frames
+    auto process_start = std::chrono::steady_clock::now();
+    size_t processed_frames = 1;
+    
+    for (size_t i = 1; i < synchronized_frames.size(); ++i) {
+        if (g_stop_requested) {
+            std::cout << "[INFO] Processing interrupted by user" << std::endl;
+            break;
+        }
+        
+        auto frame_start = std::chrono::steady_clock::now();
+        
+        // Process panorama
+        cv::Mat panorama = cuda_pipeline.ProcessFrameTriplet(
+            synchronized_frames[i].cam1_path,
+            synchronized_frames[i].cam2_path,
+            synchronized_frames[i].cam3_path
+        );
+    
+        if (panorama.empty()) {
+            std::cerr << "[WARNING] Failed to process panorama frame " << i << ", skipping..." << std::endl;
+            continue;
+        }
+        
+        // Get rectified frames
+        std::vector<cv::Mat> rectified_frames = cuda_pipeline.GetRectifiedFrames(
+            synchronized_frames[i].cam1_path,
+            synchronized_frames[i].cam2_path,
+            synchronized_frames[i].cam3_path
+        );
+        
+        if (rectified_frames[0].empty()) {
+            std::cerr << "[WARNING] Failed to get rectified frames for frame " << i << ", skipping..." << std::endl;
+            continue;
+        }
+        
+        // Ensure consistent sizes
+        if (panorama.size() != output_size) {
+            cv::resize(panorama, panorama, output_size);
+        }
+        
+        // Write panorama
+        panorama_writer.write(panorama);
+        
+        // Write rectified frames
+        for (int j = 0; j < 3; ++j) {
+            if (rectified_frames[j].size() != rectified_size) {
+                cv::resize(rectified_frames[j], rectified_frames[j], rectified_size);
             }
+            rectified_writers[j].write(rectified_frames[j]);
         }
         
-        if (writer_initialized) {
-            video_writer.release();
-            safe_cout("[INFO] Video processing completed. Total frames: " + 
-                      to_string(successful_frames));
+        processed_frames++;
+        
+        // Progress reporting
+        if (i % 30 == 0 || i == synchronized_frames.size() - 1) {
+            auto frame_end = std::chrono::steady_clock::now();
+            double frame_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                frame_end - frame_start).count();
+            
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                frame_end - process_start).count();
+            double progress = (double)i / synchronized_frames.size() * 100.0;
+            double processing_fps = processed_frames / std::max(1.0, (double)elapsed);
+            
+            std::cout << "[INFO] Progress: " << std::fixed << std::setprecision(1) 
+                      << progress << "% (" << i << "/" << synchronized_frames.size() 
+                      << ") - Processing FPS: " << std::setprecision(1) << processing_fps
+                      << " - Frame time: " << std::setprecision(0) << frame_time << "ms" << std::endl;
         }
     }
-};
+    
+    // Release video writers
+    panorama_writer.release();
+    for (int i = 0; i < 3; ++i) {
+        rectified_writers[i].release();
+    }
+    
+    auto process_end = std::chrono::steady_clock::now();
+    double total_time = std::chrono::duration_cast<std::chrono::seconds>(
+        process_end - process_start).count();
+    double avg_fps = processed_frames / std::max(1.0, total_time);
+    
+    std::cout << "\n[INFO] ✅ Videos created successfully!" << std::endl;
+    std::cout << "[INFO] Panorama output: " << output_video_path << std::endl;
+    
+    // Print rectified video paths
+    for (int i = 0; i < 3; ++i) {
+        std::string rectified_path = output_video_path;
+        size_t dot_pos = rectified_path.find_last_of('.');
+        if (dot_pos != std::string::npos) {
+            rectified_path = rectified_path.substr(0, dot_pos) + "_" + camera_names[i] + "_rectified" + rectified_path.substr(dot_pos);
+        } else {
+            rectified_path += "_" + camera_names[i] + "_rectified.mp4";
+        }
+        std::cout << "[INFO] Rectified " << camera_names[i] << " output: " << rectified_path << std::endl;
+    }
+    
+    std::cout << "[INFO] Processed frames: " << processed_frames << "/" << synchronized_frames.size() << std::endl;
+    std::cout << "[INFO] Total processing time: " << std::fixed << std::setprecision(1) << total_time << "s" << std::endl;
+    std::cout << "[INFO] Average processing FPS: " << std::setprecision(1) << avg_fps << std::endl;
+    
+    // Print CUDA pipeline statistics
+    auto cuda_stats = cuda_pipeline.GetStats();
+    std::cout << "[INFO] CUDA Pipeline Stats:" << std::endl;
+    std::cout << "[INFO]   Average processing time: " << std::fixed << std::setprecision(2) 
+              << cuda_stats.average_processing_time_ms << "ms per frame" << std::endl;
+    std::cout << "[INFO]   GPU memory used: ~" << cuda_stats.gpu_memory_used_mb << "MB" << std::endl;
+    
+    return true;
+}
 
-int main(int argc, char** argv) {
-    if (argc != 4) {
-        cerr << "Usage: " << argv[0] << " <rtsp_left> <rtsp_center> <rtsp_right>" << endl;
+int mode_capture(int argc, char** argv) {
+    if (argc < 5) {
+        std::cerr << "[ERROR] Insufficient arguments for capture mode" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " capture <rtsp1> <rtsp2> <rtsp3> [output_dir]" << std::endl;
         return -1;
     }
-
-    signal(SIGINT, signal_handler);
     
-    fs::create_directories("output");
-    fs::create_directories("debug");
-
-    vector<string> rtsp_urls = { argv[1], argv[2], argv[3] };
+    std::vector<std::string> rtsp_urls = {argv[2], argv[3], argv[4]};
+    std::string output_dir = (argc > 5) ? argv[5] : "./output";
     
-    cout << "\n=== BUFFERED SYNCHRONIZED RTSP STITCHING ===" << endl;
+    std::cout << "[INFO] === PHASE 1: SYNCHRONIZED CAPTURE ===" << std::endl;
+    std::cout << "[INFO] RTSP URLs:" << std::endl;
+    for (size_t i = 0; i < rtsp_urls.size(); ++i) {
+        std::cout << "[INFO]   Camera " << (i+1) << ": " << rtsp_urls[i] << std::endl;
+    }
+    std::cout << "[INFO] Output directory: " << output_dir << std::endl;
     
-    // Initialize synchronized frame buffer
-    SynchronizedFrameBuffer sync_buffer;
+    // Initialize capture system
+    g_capture_system = std::make_unique<SynchronizedCapture>();
     
-    // Initialize processor
-    StitchingProcessor processor(sync_buffer, "output/panorama_synchronized.mp4", 15.0);
-    if (!processor.initialize()) {
-        cerr << "[ERROR] Failed to initialize processor" << endl;
+    // Start capture
+    if (!g_capture_system->CaptureAllStreams(rtsp_urls, output_dir)) {
+        std::cerr << "[ERROR] Failed to start capture" << std::endl;
         return -1;
     }
     
-    // Create camera capture instances
-    vector<unique_ptr<CameraCapture>> cameras;
-    for (int i = 0; i < 3; i++) {
-        cameras.push_back(make_unique<CameraCapture>(i, rtsp_urls[i], sync_buffer));
+    std::cout << "[INFO] Capture started. Press Ctrl+C to stop..." << std::endl;
+    
+    // Wait for stop signal
+    while (!g_stop_requested) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        // Print statistics every 10 seconds
+        static auto last_stats_time = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stats_time).count() >= 10) {
+            auto stats = g_capture_system->GetStats();
+            std::cout << "[STATS] Frames captured: CAM1=" << stats.frames_captured[0] 
+                      << ", CAM2=" << stats.frames_captured[1] 
+                      << ", CAM3=" << stats.frames_captured[2] 
+                      << " | Dropped: " << stats.dropped_frames 
+                      << " | Duration: " << stats.total_duration.count() << "s" << std::endl;
+            last_stats_time = now;
+        }
     }
     
-    // Start all cameras
-    cout << "[INFO] Starting camera captures..." << endl;
-    for (auto& camera : cameras) {
-        camera->start();
-        this_thread::sleep_for(chrono::milliseconds(100));
+    // Save metadata
+    std::cout << "[INFO] Saving metadata..." << std::endl;
+    if (!g_capture_system->SaveMetadata(output_dir)) {
+        std::cerr << "[ERROR] Failed to save metadata" << std::endl;
+        return -1;
     }
     
-    // Start processing immediately
-    thread processing_thread(&StitchingProcessor::processFrames, &processor);
-    
-    // Keep main thread alive
-    while (!stop_requested) {
-        this_thread::sleep_for(chrono::milliseconds(100));
-    }
-    
-    // Stop cameras first
-    cout << "[INFO] Stopping cameras..." << endl;
-    for (auto& camera : cameras) {
-        camera->stop();
-    }
-    
-    // Signal that cameras are stopped
-    cameras_stopped = true;
-    
-    // Finalize any remaining frames in buffers
-    sync_buffer.finalizeProcessing();
-    
-    // Wait for processing to complete
-    if (processing_thread.joinable()) {
-        cout << "[INFO] Processing remaining frames..." << endl;
-        processing_thread.join();
-    }
-    
-    cout << "\n=== PROCESSING COMPLETE ===" << endl;
-    cout << "Final panorama: output/panorama_synchronized.mp4" << endl;
-    cout << "Raw camera footage:" << endl;
-    cout << "  Camera 0 (left): output/camera_0_raw.mp4" << endl;
-    cout << "  Camera 1 (center): output/camera_1_raw.mp4" << endl;
-    cout << "  Camera 2 (right): output/camera_2_raw.mp4" << endl;
-    cout << "Debug frames: debug/" << endl;
+    // Final statistics
+    auto final_stats = g_capture_system->GetStats();
+    std::cout << "\n[INFO] ✅ Capture completed successfully!" << std::endl;
+    std::cout << "[INFO] Final Statistics:" << std::endl;
+    std::cout << "[INFO]   Total duration: " << final_stats.total_duration.count() << "s" << std::endl;
+    std::cout << "[INFO]   Frames captured: CAM1=" << final_stats.frames_captured[0] 
+              << ", CAM2=" << final_stats.frames_captured[1] 
+              << ", CAM3=" << final_stats.frames_captured[2] << std::endl;
+    std::cout << "[INFO]   Average FPS: CAM1=" << std::fixed << std::setprecision(1) << final_stats.average_fps[0]
+              << ", CAM2=" << final_stats.average_fps[1] 
+              << ", CAM3=" << final_stats.average_fps[2] << std::endl;
+    std::cout << "[INFO]   Dropped frames: " << final_stats.dropped_frames << std::endl;
+    std::cout << "[INFO] Raw frames saved in: " << output_dir << "/raw_frames/" << std::endl;
+    std::cout << "[INFO] Metadata saved in: " << output_dir << "/metadata/" << std::endl;
     
     return 0;
+}
+
+int mode_process(int argc, char** argv) {
+    if (argc < 3) {
+        std::cerr << "[ERROR] Insufficient arguments for process mode" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " process <metadata_dir> [output_video]" << std::endl;
+        return -1;
+    }
+    
+    std::string metadata_dir = argv[2];
+    std::string output_video = (argc > 3) ? argv[3] : "./panorama_result.mp4";
+    
+    std::cout << "[INFO] === PHASE 2: SYNCHRONIZED PROCESSING ===" << std::endl;
+    std::cout << "[INFO] Metadata directory: " << metadata_dir << std::endl;
+    std::cout << "[INFO] Output video: " << output_video << std::endl;
+    
+    // Load metadata
+    std::vector<std::vector<FrameMetadata>> camera_metadata;
+    if (!load_metadata_files(metadata_dir, camera_metadata)) {
+        std::cerr << "[ERROR] Failed to load metadata files" << std::endl;
+        return -1;
+    }
+    
+    // Synchronize frames
+    std::cout << "[INFO] Synchronizing frames..." << std::endl;
+    FrameSynchronizer synchronizer;
+    
+    // Configure synchronizer for post-processing (more lenient)
+    synchronizer.SetSyncWindow(std::chrono::milliseconds(50)); // 50ms window
+    synchronizer.SetMinSyncQuality(100.0); // 100ms max deviation
+    
+    auto synchronized_frames = synchronizer.FindOptimalSync(
+        camera_metadata[0], camera_metadata[1], camera_metadata[2]);
+    
+    if (synchronized_frames.empty()) {
+        std::cerr << "[ERROR] No synchronized frames found" << std::endl;
+        return -1;
+    }
+    
+    // Print synchronization statistics
+    auto sync_stats = synchronizer.GetSyncStats();
+    std::cout << "[INFO] Synchronization Results:" << std::endl;
+    std::cout << "[INFO]   Synchronized triplets: " << sync_stats.total_triplets_found << std::endl;
+    std::cout << "[INFO]   Perfect sync (<5ms): " << sync_stats.perfect_sync_triplets << std::endl;
+    std::cout << "[INFO]   Good sync (<16.7ms): " << sync_stats.good_sync_triplets << std::endl;
+    std::cout << "[INFO]   Average sync quality: " << std::fixed << std::setprecision(2) 
+              << sync_stats.average_sync_quality << "ms" << std::endl;
+    std::cout << "[INFO]   Effective FPS: " << std::setprecision(1) 
+              << sync_stats.effective_fps << std::endl;
+    
+    // Create panorama video
+    if (!create_panorama_video(synchronized_frames, output_video)) {
+        std::cerr << "[ERROR] Failed to create panorama video" << std::endl;
+        return -1;
+    }
+    
+    return 0;
+}
+
+int mode_full(int argc, char** argv) {
+    if (argc < 5) {
+        std::cerr << "[ERROR] Insufficient arguments for full mode" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " full <rtsp1> <rtsp2> <rtsp3> [output_dir] [output_video]" << std::endl;
+        return -1;
+    }
+    
+    std::string output_dir = (argc > 5) ? argv[5] : "./output";
+    std::string output_video = (argc > 6) ? argv[6] : "./panorama_result.mp4";
+    
+    std::cout << "[INFO] === FULL PIPELINE: CAPTURE + PROCESS ===" << std::endl;
+    
+    // Phase 1: Capture
+    std::cout << "\n" << std::string(60, '=') << std::endl;
+    std::cout << "PHASE 1: SYNCHRONIZED CAPTURE" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
+    
+    // Modify argv for capture mode
+    char* capture_argv[] = {argv[0], (char*)"capture", argv[2], argv[3], argv[4], (char*)output_dir.c_str()};
+    int capture_result = mode_capture(6, capture_argv);
+    
+    if (capture_result != 0) {
+        std::cerr << "[ERROR] Capture phase failed" << std::endl;
+        return capture_result;
+    }
+    
+    // Phase 2: Process
+    std::cout << "\n" << std::string(60, '=') << std::endl;
+    std::cout << "PHASE 2: SYNCHRONIZED PROCESSING" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
+    
+    // Reset stop signal for processing phase
+    g_stop_requested = false;
+    
+    // Modify argv for process mode
+    char* process_argv[] = {argv[0], (char*)"process", (char*)output_dir.c_str(), (char*)output_video.c_str()};
+    int process_result = mode_process(4, process_argv);
+    
+    if (process_result != 0) {
+        std::cerr << "[ERROR] Process phase failed" << std::endl;
+        return process_result;
+    }
+    
+    std::cout << "\n" << std::string(60, '=') << std::endl;
+    std::cout << "🎉 FULL PIPELINE COMPLETED SUCCESSFULLY!" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
+    std::cout << "[INFO] Raw frames: " << output_dir << "/raw_frames/" << std::endl;
+    std::cout << "[INFO] Metadata: " << output_dir << "/metadata/" << std::endl;
+    std::cout << "[INFO] Final video: " << output_video << std::endl;
+    
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    // Install signal handler
+    std::signal(SIGINT, signal_handler);
+    
+    if (argc < 2) {
+        print_usage(argv[0]);
+        return -1;
+    }
+    
+    std::string mode = argv[1];
+    
+    std::cout << "[INFO] RTSP Stitcher v2.0 - Two-Phase Synchronized Processing" << std::endl;
+    std::cout << "[INFO] Mode: " << mode << std::endl;
+    
+    if (mode == "capture") {
+        return mode_capture(argc, argv);
+    } else if (mode == "process") {
+        return mode_process(argc, argv);
+    } else if (mode == "full") {
+        return mode_full(argc, argv);
+    } else {
+        std::cerr << "[ERROR] Unknown mode: " << mode << std::endl;
+        print_usage(argv[0]);
+        return -1;
+    }
 }

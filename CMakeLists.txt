@@ -51,7 +51,7 @@ add_executable(${PROJECT_NAME} ${SOURCES})
 # Find required packages
 find_package(PkgConfig REQUIRED)
 find_package(OpenGL REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d objdetect aruco videoio highgui)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d objdetect aruco videoio highgui cudaimgproc cudawarping cudaarithm)
 find_package(glm REQUIRED)
 
 # FIXED: Find nlohmann/json
@@ -149,6 +149,11 @@ find_package(Threads REQUIRED)
 add_executable(rtsp_stitcher
     src/rtsp_stitcher.cc
     src/stitching.cc
+    src/synchronized_capture.cc
+    src/frame_synchronizer.cc
+    src/async_frame_writer.cc
+    src/cuda_stitching_pipeline.cc
+    src/error_handler.cc
 )
 
 target_include_directories(rtsp_stitcher PRIVATE
@@ -161,6 +166,20 @@ target_link_libraries(rtsp_stitcher
     ${OpenCV_LIBS}
     Threads::Threads
 )
+
+# Print OpenCV information
+message(STATUS "OpenCV version: ${OpenCV_VERSION}")
+message(STATUS "OpenCV libs: ${OpenCV_LIBS}")
+message(STATUS "OpenCV include dirs: ${OpenCV_INCLUDE_DIRS}")
+
+# Check if CUDA modules are available
+if(OpenCV_FOUND)
+    foreach(lib ${OpenCV_LIBS})
+        if(lib MATCHES "cudaimgproc" OR lib MATCHES "cudawarping" OR lib MATCHES "cudaarithm")
+            message(STATUS "Found OpenCV CUDA module: ${lib}")
+        endif()
+    endforeach()
+endif()
 
 # Print configuration summary
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
