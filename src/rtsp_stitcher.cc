@@ -83,7 +83,7 @@ bool create_panorama_video(const std::vector<SyncedFrameTriplet>& synchronized_f
                           const std::string& output_video_path) {
     
     if (synchronized_frames.empty()) {
-        std::cerr << "[ERROR] No synchronized frames to process" << std::endl;
+        std::cerr << "[ERROR] No synchronized frames found" << std::endl;
         return false;
     }
     
@@ -119,7 +119,7 @@ bool create_panorama_video(const std::vector<SyncedFrameTriplet>& synchronized_f
         return false;
     }
     
-    // Process first frame to get output size
+    // Process first frame to get output size and rectified frames
     cv::Mat first_panorama = cuda_pipeline.ProcessFrameTriplet(
         synchronized_frames[0].cam1_path,
         synchronized_frames[0].cam2_path,
@@ -131,24 +131,64 @@ bool create_panorama_video(const std::vector<SyncedFrameTriplet>& synchronized_f
         return false;
     }
     
-    cv::Size output_size = first_panorama.size();
-    std::cout << "[INFO] Output panorama size: " << output_size << std::endl;
+    // Get first rectified frames to determine their size
+    std::vector<cv::Mat> first_rectified = cuda_pipeline.GetRectifiedFrames(
+        synchronized_frames[0].cam1_path,
+        synchronized_frames[0].cam2_path,
+        synchronized_frames[0].cam3_path
+    );
     
-    // Initialize video writer
-    double fps = 24.0; // Target FPS
-    int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
-    cv::VideoWriter video_writer(output_video_path, fourcc, fps, output_size);
-    
-    if (!video_writer.isOpened()) {
-        std::cerr << "[ERROR] Failed to open video writer: " << output_video_path << std::endl;
+    if (first_rectified[0].empty()) {
+        std::cerr << "[ERROR] Failed to get rectified frames" << std::endl;
         return false;
     }
     
-    std::cout << "[INFO] Video writer initialized: " << output_video_path 
-              << " (" << output_size << " @ " << fps << " FPS)" << std::endl;
+    cv::Size output_size = first_panorama.size();
+    cv::Size rectified_size = first_rectified[0].size();
+    std::cout << "[INFO] Output panorama size: " << output_size << std::endl;
+    std::cout << "[INFO] Rectified frame size: " << rectified_size << std::endl;
     
-    // Write first frame
-    video_writer.write(first_panorama);
+    // Initialize video writers
+    double fps = 24.0; // Target FPS
+    int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+    
+    // Panorama video writer
+    cv::VideoWriter panorama_writer(output_video_path, fourcc, fps, output_size);
+    if (!panorama_writer.isOpened()) {
+        std::cerr << "[ERROR] Failed to open panorama video writer: " << output_video_path << std::endl;
+        return false;
+    }
+    
+    // Individual rectified video writers
+    std::vector<cv::VideoWriter> rectified_writers(3);
+    std::vector<std::string> camera_names = {"cam1", "cam2", "cam3"};
+    
+    for (int i = 0; i < 3; ++i) {
+        // Create output path for each camera's rectified video
+        std::string rectified_path = output_video_path;
+        size_t dot_pos = rectified_path.find_last_of('.');
+        if (dot_pos != std::string::npos) {
+            rectified_path = rectified_path.substr(0, dot_pos) + "_" + camera_names[i] + "_rectified" + rectified_path.substr(dot_pos);
+        } else {
+            rectified_path += "_" + camera_names[i] + "_rectified.mp4";
+        }
+        
+        rectified_writers[i].open(rectified_path, fourcc, fps, rectified_size);
+        if (!rectified_writers[i].isOpened()) {
+            std::cerr << "[ERROR] Failed to open rectified video writer for " << camera_names[i] << ": " << rectified_path << std::endl;
+            return false;
+        }
+        
+        std::cout << "[INFO] Rectified video writer initialized for " << camera_names[i] << ": " << rectified_path << std::endl;
+    }
+    
+    std::cout << "[INFO] Video writers initialized" << std::endl;
+    
+    // Write first frames
+    panorama_writer.write(first_panorama);
+    for (int i = 0; i < 3; ++i) {
+        rectified_writers[i].write(first_rectified[i]);
+    }
     
     // Process remaining frames
     auto process_start = std::chrono::steady_clock::now();
@@ -162,23 +202,46 @@ bool create_panorama_video(const std::vector<SyncedFrameTriplet>& synchronized_f
         
         auto frame_start = std::chrono::steady_clock::now();
         
+        // Process panorama
         cv::Mat panorama = cuda_pipeline.ProcessFrameTriplet(
             synchronized_frames[i].cam1_path,
             synchronized_frames[i].cam2_path,
             synchronized_frames[i].cam3_path
         );
-        
+    
         if (panorama.empty()) {
-            std::cerr << "[WARNING] Failed to process frame " << i << ", skipping..." << std::endl;
+            std::cerr << "[WARNING] Failed to process panorama frame " << i << ", skipping..." << std::endl;
             continue;
         }
         
-        // Ensure consistent size
+        // Get rectified frames
+        std::vector<cv::Mat> rectified_frames = cuda_pipeline.GetRectifiedFrames(
+            synchronized_frames[i].cam1_path,
+            synchronized_frames[i].cam2_path,
+            synchronized_frames[i].cam3_path
+        );
+        
+        if (rectified_frames[0].empty()) {
+            std::cerr << "[WARNING] Failed to get rectified frames for frame " << i << ", skipping..." << std::endl;
+            continue;
+        }
+        
+        // Ensure consistent sizes
         if (panorama.size() != output_size) {
             cv::resize(panorama, panorama, output_size);
         }
         
-        video_writer.write(panorama);
+        // Write panorama
+        panorama_writer.write(panorama);
+        
+        // Write rectified frames
+        for (int j = 0; j < 3; ++j) {
+            if (rectified_frames[j].size() != rectified_size) {
+                cv::resize(rectified_frames[j], rectified_frames[j], rectified_size);
+            }
+            rectified_writers[j].write(rectified_frames[j]);
+        }
+        
         processed_frames++;
         
         // Progress reporting
@@ -199,15 +262,32 @@ bool create_panorama_video(const std::vector<SyncedFrameTriplet>& synchronized_f
         }
     }
     
-    video_writer.release();
+    // Release video writers
+    panorama_writer.release();
+    for (int i = 0; i < 3; ++i) {
+        rectified_writers[i].release();
+    }
     
     auto process_end = std::chrono::steady_clock::now();
     double total_time = std::chrono::duration_cast<std::chrono::seconds>(
         process_end - process_start).count();
     double avg_fps = processed_frames / std::max(1.0, total_time);
     
-    std::cout << "\n[INFO] ✅ Panorama video created successfully!" << std::endl;
-    std::cout << "[INFO] Output: " << output_video_path << std::endl;
+    std::cout << "\n[INFO] ✅ Videos created successfully!" << std::endl;
+    std::cout << "[INFO] Panorama output: " << output_video_path << std::endl;
+    
+    // Print rectified video paths
+    for (int i = 0; i < 3; ++i) {
+        std::string rectified_path = output_video_path;
+        size_t dot_pos = rectified_path.find_last_of('.');
+        if (dot_pos != std::string::npos) {
+            rectified_path = rectified_path.substr(0, dot_pos) + "_" + camera_names[i] + "_rectified" + rectified_path.substr(dot_pos);
+        } else {
+            rectified_path += "_" + camera_names[i] + "_rectified.mp4";
+        }
+        std::cout << "[INFO] Rectified " << camera_names[i] << " output: " << rectified_path << std::endl;
+    }
+    
     std::cout << "[INFO] Processed frames: " << processed_frames << "/" << synchronized_frames.size() << std::endl;
     std::cout << "[INFO] Total processing time: " << std::fixed << std::setprecision(1) << total_time << "s" << std::endl;
     std::cout << "[INFO] Average processing FPS: " << std::setprecision(1) << avg_fps << std::endl;

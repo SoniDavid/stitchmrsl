@@ -243,6 +243,36 @@ cv::Mat CUDAStitchingPipeline::ProcessFrameTriplet(const std::string& cam1_path,
     return result;
 }
 
+std::vector<cv::Mat> CUDAStitchingPipeline::GetRectifiedFrames(const std::string& cam1_path,
+                                                               const std::string& cam2_path,
+                                                               const std::string& cam3_path) {
+    std::vector<cv::Mat> rectified_frames(3);
+    
+    if (!gpu_initialized_) {
+        std::cerr << "[CUDA] Pipeline not initialized" << std::endl;
+        return rectified_frames;
+    }
+    
+    // Load images to GPU
+    if (!LoadImagesToGPU(cam1_path, cam2_path, cam3_path)) {
+        std::cerr << "[CUDA] Failed to load images to GPU" << std::endl;
+        return rectified_frames;
+    }
+    
+    // Rectify images on GPU
+    if (!RectifyImagesGPU()) {
+        std::cerr << "[CUDA] Failed to rectify images on GPU" << std::endl;
+        return rectified_frames;
+    }
+    
+    // Download rectified frames to CPU
+    for (int i = 0; i < 3; ++i) {
+        gpu_rectified_[i].download(rectified_frames[i]);
+    }
+    
+    return rectified_frames;
+}
+
 bool CUDAStitchingPipeline::AllocateGPUMemory(const cv::Size& input_size) {
     try {
         // Allocate memory for input frames (3 channels, float)

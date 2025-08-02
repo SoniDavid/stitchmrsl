@@ -27,6 +27,10 @@ public:
     cv::Mat ProcessFrameTriplet(const std::string& cam1_path,
                                const std::string& cam2_path, 
                                const std::string& cam3_path);
+
+    std::vector<cv::Mat> GetRectifiedFrames(const std::string& cam1_path,
+                                           const std::string& cam2_path,
+                                           const std::string& cam3_path);
     
     // Batch process multiple triplets
     std::vector<cv::Mat> ProcessBatch(const std::vector<std::tuple<std::string, std::string, std::string>>& triplets);
