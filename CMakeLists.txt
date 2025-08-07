@@ -167,6 +167,22 @@ target_link_libraries(rtsp_stitcher
     Threads::Threads
 )
 
+# Add video_rectifier executable
+add_executable(video_rectifier
+    src/video_rectifier.cc
+)
+
+target_include_directories(video_rectifier PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+    ${NLOHMANN_JSON_INCLUDE_DIR}
+)
+
+target_link_libraries(video_rectifier
+    ${OpenCV_LIBS}
+    Threads::Threads
+)
+
 # Print OpenCV information
 message(STATUS "OpenCV version: ${OpenCV_VERSION}")
 message(STATUS "OpenCV libs: ${OpenCV_LIBS}")
@@ -185,4 +201,4 @@ endif()
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "OpenCV version: ${OpenCV_VERSION}")
-message(STATUS "Executable: ${PROJECT_NAME}, rtsp_stitcher")
+message(STATUS "Executable: ${PROJECT_NAME}, rtsp_stitcher, video_rectifier")
