@@ -6,6 +6,8 @@
 #include <iomanip>
 #include <csignal>
 #include <atomic>
+#include <fstream>
+#include <nlohmann/json.hpp>
 
 namespace fs = std::filesystem;
 
@@ -53,7 +55,7 @@ private:
     } camera_;
 
 public:
-    VideoRectifier() : gpu_initialized_(false), camera_index_(-1) {}
+    VideoRectifier() : camera_index_(-1), gpu_initialized_(false) {}
     
     ~VideoRectifier() {
         Cleanup();
