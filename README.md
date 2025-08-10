@@ -360,7 +360,7 @@ This project follows standard C++ and Python development practices:
 
 ## 📄 **License**
 
-[Include your license information here]
+🐄
 - CMake 3.12+
 - C++17 compatible compiler
 
@@ -402,19 +402,6 @@ pipeline.SetOutputSize(cv::Size(3840, 1080));  // Custom output resolution
 - **Memory Usage**: ~2GB GPU memory for 1080p processing
 - **CPU Usage**: ~20% (mostly I/O and synchronization)
 - **GPU Usage**: ~80-90% during processing phase
-
-## 🤝 **Contributing**
-
-This project follows standard C++ and Python development practices:
-
-- **Code Style**: Follow existing formatting and naming conventions  
-- **Documentation**: Update relevant `.md` files for new features
-- **Testing**: Validate changes with sample data in `imgs/`
-- **Performance**: Monitor GPU memory usage and processing times
-
-## 📄 **License**
-🐄
----
 
 **🚀 High-Performance Multi-Camera Panoramic Stitching with CUDA Acceleration**
 
